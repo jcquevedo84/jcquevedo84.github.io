@@ -1,0 +1,19 @@
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# IDE configuration
+.idea/
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+.next/
+
+# Local course resources
+resource/
