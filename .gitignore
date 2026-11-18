@@ -3,6 +3,7 @@
 .env
 .env.*
 !.env.example
+.aws
 
 # IDE configuration
 .idea/
@@ -14,6 +15,8 @@ node_modules/
 dist/
 build/
 .next/
+out/
+*.tsbuildinfo
 
 # Local course resources
 resource/
