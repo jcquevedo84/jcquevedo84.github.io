@@ -1,6 +1,5 @@
 import { Navigation } from "@/components/Navigation";
 import { Reveal } from "@/components/Reveal";
-import { DigitalTwin } from "@/components/DigitalTwin";
 import { ContactOptions } from "@/components/ContactOptions";
 import { ProfessionalPortrait } from "@/components/ProfessionalPortrait";
 import { professionalContact } from "@/lib/contact";
@@ -99,7 +98,11 @@ const currentLearning = [
   },
 ];
 
-export default function Home() {
+export default async function Home() {
+  const DigitalTwin = process.env.NEXT_PUBLIC_DIGITAL_TWIN_ENABLED === "false"
+    ? null
+    : (await import("@/components/DigitalTwin")).DigitalTwin;
+
   const structuredData = {
     "@context": "https://schema.org",
     "@type": "Person",
@@ -409,7 +412,7 @@ export default function Home() {
         </div>
       </footer>
 
-      <DigitalTwin />
+      {DigitalTwin && <DigitalTwin />}
       <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(structuredData) }} />
     </>
   );

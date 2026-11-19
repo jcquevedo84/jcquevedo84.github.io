@@ -54,7 +54,7 @@ npm run preview
 
 For release-equivalent validation, run `npm ci` and `npm run verify` in a clean checkout with the pinned toolchain. The gate runs ESLint, generates Next.js route types, checks TypeScript, runs mock-only tests, builds the static site, and verifies the fresh `out/` directory. Builds also run Next.js's own TypeScript check.
 
-Static verification checks public assets, the V2 client bundle, private paths and document markers, backend-only variable names, and credential values explicitly supplied in the process environment. It never reads `.env` and reports counts only. CI uses synthetic credential values and an inert public API URL. The separate OpenRouter diagnostic is a live check outside the gate.
+Static verification checks public content and root-relative assets, private paths and document markers, backend-only variable names, and credential values explicitly supplied in the process environment. It expects the launcher and V2 client bundle by default. In disabled mode it checks exported HTML, route payloads, and JavaScript for chat markup and API references. It never reads `.env` and reports counts only. CI uses synthetic credential values and an inert public API URL. The separate OpenRouter diagnostic is a live check outside the gate.
 
 `npm run diagnose:openrouter` makes one minimal Chat Completions request using the exact configured model, a redacted prompt, and a 16-token output limit. It recognizes `openrouter/free` and model identifiers ending in `:free` as zero-cost; every other identifier is refused unless the separate, explicit `--allow-paid` flag is supplied. The command never prints credentials, prompts, professional knowledge, or completion content.
 
@@ -68,7 +68,7 @@ Production chat requests default to `OPENROUTER_MAX_COMPLETION_TOKENS=1500`; con
 
 1. `app/` and `components/` contain the statically exported portfolio and browser-only chat interface.
 2. `server/` contains the standalone API, curated public-safe professional knowledge, prompt policy, request validation, rate limiting, CORS handling, and the OpenRouter client.
-3. The browser calls `NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL`. This value is public and contains no credential. When unset on localhost, the browser uses the same hostname on port 8787. Production builds must set the deployed HTTPS API URL explicitly.
+3. When the widget is enabled, the browser calls `NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL`. This value is public and contains no credential. When unset on localhost, the browser uses the same hostname on port 8787. A future public build with the widget enabled must set the deployed HTTPS API URL explicitly.
 4. The backend reads `OPENROUTER_API_KEY` and `OPENROUTER_MODEL`, then calls `https://openrouter.ai/api/v1/chat/completions` with that exact configured model. Neither variable is returned to the browser.
 
 The original professional documents remain under ignored `resource/` storage and are not read at runtime, copied into the static site, or sent to OpenRouter. The backend sends only topic-selected sections from a curated public-safe knowledge representation.
@@ -100,11 +100,35 @@ The approved navy collared-shirt portrait is integrated into the About section f
 
 These controls reduce risk but do not guarantee prompt-injection prevention. Before public deployment, use trusted proxy configuration, durable/distributed rate limiting, managed secret storage, abuse monitoring, appropriate provider budget limits, operational alerting, and a reviewed privacy notice. CORS limits browser origins but is not authentication.
 
-## Future deployment configuration
+## GitHub Pages release
 
-The CI workflow validates the build. For a future Pages release, publish only the verified contents of `out/` and keep the independent Digital Twin backend deployed separately. The current paths assume the site is hosted at the domain root. If branch publishing is selected, preserve `_next/` by adding `.nojekyll` to the publish root.
+The Pages workflow builds the domain-root site with `NEXT_PUBLIC_DIGITAL_TWIN_ENABLED=false`, runs the full verification gate, and uploads the same verified `out/` directory. The build skips the widget import and leaves its browser code out of the export. Pages serves the artifact directly and preserves `_next/` without a Jekyll build. The portfolio runs without a Next.js server or a Digital Twin API.
 
-For `jcquevedo84.github.io`, build the frontend with an HTTPS API URL:
+To preview the public build with the pinned toolchain from a clean checkout:
+
+```bash
+nvm use
+npm ci
+NEXT_PUBLIC_DIGITAL_TWIN_ENABLED=false npm run verify
+npm run preview
+```
+
+Leave the flag unset for local development and CI validation with the widget. When rechecking an existing disabled export, run `NEXT_PUBLIC_DIGITAL_TWIN_ENABLED=false npm run verify:static` before rebuilding in another mode.
+
+### Configure publishing and verify the release
+
+1. Before switching the publishing source, record the current source and the latest successful deployment. The live site checked during P01 was titled **SpaceX Platzi** and used **Deploy from a branch**, `master`, and `/ (root)`. Publishing the portfolio replaces the site at the same URL.
+2. In **Settings → Pages → Build and deployment**, set **Source** to **GitHub Actions**. Keep the custom domain unset and HTTPS enabled.
+3. In **Settings → Environments → github-pages**, ensure **Deployment branches and tags** permits `feature/professional-portfolio`. If it does not, select **Selected branches and tags** and add a **Branch** rule for that exact name. Preserve existing reviewer requirements and any other required rules.
+4. Push the reviewed commit to `feature/professional-portfolio`. The Pages workflow runs on pushes to this branch. In **Actions**, check that both the build and deployment jobs succeeded for the reviewed commit. Open the environment URL and confirm the portfolio, portrait, navigation, and contact links load. In the browser’s Network panel, reload and confirm the root-relative CSS, JavaScript, and portrait load and there are no Digital Twin requests.
+
+### Rollback
+
+For the first release, cancel any pending Pages workflow runs and restore **Settings → Pages → Source → Deploy from a branch**, with branch `master` and folder `/ (root)`. Save and confirm that GitHub reports a successful Pages deployment and that the root URL again serves **SpaceX Platzi**. If the previous source recorded before release differs, restore those recorded settings instead. For later portfolio-only recovery, restore the last approved portfolio code on the release branch through a reviewed change and redeploy through the same gate with the widget disabled.
+
+## Future Digital Twin deployment
+
+Once the public API protections are ready, review the Pages workflow and the standalone API deployment together. For a local preview of a future enabled production configuration, use a deployed HTTPS API URL:
 
 ```bash
 NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL=https://api.example.com npm run build
