@@ -3,6 +3,7 @@
 .env
 .env.*
 !.env.example
+.dev.vars*
 .aws
 
 # IDE configuration
@@ -15,6 +16,7 @@ node_modules/
 dist/
 build/
 .next/
+.wrangler/
 next-env.d.ts
 out/
 *.tsbuildinfo

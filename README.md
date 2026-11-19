@@ -45,6 +45,31 @@ The signing key must contain 32–64 cryptographically random bytes encoded as h
 
 The combined command checks ports 3000 and 8787 first and stops without killing an existing process when either port is occupied.
 
+### Local Cloudflare Worker compatibility
+
+Use the Node.js API above for normal local Digital Twin development. The Phase 1 Worker provides a separate Fetch adapter for `GET /health`, `OPTIONS /v2/chat`, and `POST /v2/chat`. It shares the chat service, validation, knowledge selection, signed continuations, and OpenRouter client with Node.js.
+
+```bash
+nvm use
+npm ci
+npm run test:worker
+```
+
+The tests run the Worker in `workerd` through Miniflare. They generate synthetic bindings, call a controlled loopback provider, and block external fetches. Neither the frontend nor the Node.js API needs to be running.
+
+To start the standalone Worker for a local health check:
+
+```bash
+CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV=false CLOUDFLARE_INCLUDE_PROCESS_ENV=false \
+  ./node_modules/.bin/wrangler dev --local --ip 127.0.0.1 --port 8788
+# From another terminal
+curl --fail http://127.0.0.1:8788/health
+```
+
+Use an isolated checkout with no local secret files for the Wrangler command. The Worker accepts only an explicit HTTP fixture URL on `127.0.0.1` with an unprivileged port and does not follow provider redirects. Use the integration suite to exercise chat with synthetic bindings. The local health check needs no bindings.
+
+The Worker uses Fetch streams and request cancellation signals. Cloudflare handles connection framing, including `100 Continue` and malformed wire-level requests. Node.js still handles those at its HTTP boundary and continues serving V1 for local clients. The Wrangler config disables both `workers_dev` and preview URLs. The public portfolio stays on GitHub Pages with chat disabled while Turnstile, quotas, and concurrency controls are pending.
+
 ## Validation and static preview
 
 ```bash
@@ -52,7 +77,7 @@ npm run verify
 npm run preview
 ```
 
-For release-equivalent validation, run `npm ci` and `npm run verify` in a clean checkout with the pinned toolchain. The gate runs ESLint, generates Next.js route types, checks TypeScript, runs mock-only tests, builds the static site, and verifies the fresh `out/` directory. Builds also run Next.js's own TypeScript check.
+For release-equivalent validation, run `npm ci` and `npm run verify` in a clean checkout with the pinned toolchain. The gate runs ESLint, generates Next.js route types, checks TypeScript, runs mock-only Node.js and Worker tests, builds the static site, and verifies the fresh `out/` directory. Builds also run Next.js's own TypeScript check.
 
 Static verification checks public content and root-relative assets, private paths and document markers, backend-only variable names, and credential values explicitly supplied in the process environment. It expects the launcher and V2 client bundle by default. In disabled mode it checks exported HTML, route payloads, and JavaScript for chat markup and API references. It never reads `.env` and reports counts only. CI uses synthetic credential values and an inert public API URL. The separate OpenRouter diagnostic is a live check outside the gate.
 
@@ -144,4 +169,4 @@ Configure `OPENROUTER_API_KEY` as a secret in the independently deployed backend
 
 Provision `DIGITAL_TWIN_CONVERSATION_SIGNING_KEY` in the backend's managed secret store. Use a dedicated random key per environment and share that environment's key across its backend replicas. Keep the key out of frontend build variables, source control, and logs. Provision the V2-capable backend before publishing the updated static frontend. Rotation makes outstanding tokens fail verification, and visitors can Retry without earlier context. If the frontend needs to roll back, keep the hardened V1 backend behavior so older clients continue using latest-question-only inference.
 
-The backend HTTP adapter currently targets Node.js. The knowledge selection, validation, prompt, and OpenRouter modules use portable JavaScript/fetch boundaries so a future Cloudflare Worker deployment can replace only the HTTP/environment adapter.
+Public Worker deployment requires the admission controls and provider privacy review in B01 Phase 2.

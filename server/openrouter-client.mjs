@@ -156,6 +156,7 @@ async function readResponseBody(response, signal) {
   }
 
   const reader = response.body.getReader();
+  const decoder = new TextDecoder();
   const chunks = [];
   let bytes = 0;
   let complete = false;
@@ -180,9 +181,10 @@ async function readResponseBody(response, signal) {
       }
       bytes += value.byteLength;
       if (bytes > MAX_RESPONSE_BYTES) throw new ProviderBodyTooLargeError();
-      if (value.byteLength > 0) chunks.push(value);
+      if (value.byteLength > 0) chunks.push(decoder.decode(value, { stream: true }));
     }
-    return { text: new TextDecoder().decode(Buffer.concat(chunks, bytes)), bytes };
+    chunks.push(decoder.decode());
+    return { text: chunks.join(""), bytes };
   } finally {
     signal.removeEventListener("abort", cancel);
     if (!complete) cancel();

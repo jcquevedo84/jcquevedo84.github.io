@@ -112,29 +112,33 @@ test("OpenRouter client classifies provider HTTP failures without exposing respo
 
 test("OpenRouter diagnostics correlate request and response while redacting sensitive content", async () => {
   const records = [];
+  let sentBodyBytes;
   const client = createOpenRouterClient({
     ...baseConfiguration,
     debug: true,
     logger: { log: (line) => records.push(JSON.parse(line)) },
     now: () => 1_000,
     correlationIdFactory: () => "correlation-test-1",
-    fetchImpl: async () => new Response(JSON.stringify({
-      model: "provider/actual-free-model",
-      choices: [{ message: { role: "assistant", content: "OK" }, finish_reason: "stop" }],
-      usage: {
-        prompt_tokens: 42,
-        completion_tokens: 19,
-        completion_tokens_details: { reasoning_tokens: 7 },
-      },
-    }), {
-      status: 200,
-      headers: { "Content-Type": "application/json", "X-Request-Id": "provider-request-1" },
-    }),
+    fetchImpl: async (_url, { body }) => {
+      sentBodyBytes = Buffer.byteLength(body);
+      return new Response(JSON.stringify({
+        model: "provider/actual-free-model",
+        choices: [{ message: { role: "assistant", content: "OK" }, finish_reason: "stop" }],
+        usage: {
+          prompt_tokens: 42,
+          completion_tokens: 19,
+          completion_tokens_details: { reasoning_tokens: 7 },
+        },
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "X-Request-Id": "provider-request-1" },
+      });
+    },
   });
 
   const answer = await client.complete(
     "PRIVATE PROFESSIONAL KNOWLEDGE sk-or-v1-system-secret",
-    [{ role: "user", content: "private recruiter question user@example.com" }],
+    [{ role: "user", content: "private recruiter question user@example.com · Córdoba 👩🏽‍💻" }],
   );
 
   assert.equal(answer, "OK");
@@ -142,6 +146,7 @@ test("OpenRouter diagnostics correlate request and response while redacting sens
   assert.equal(records[0].event, "openrouter.request");
   assert.equal(records[1].event, "openrouter.response");
   assert.equal(records[0].correlationId, "correlation-test-1");
+  assert.equal(records[0].requestBodyBytes, sentBodyBytes);
   assert.equal(records[1].correlationId, "correlation-test-1");
   assert.deepEqual(records[0].messageRoles, ["system", "user"]);
   assert.deepEqual(records[0].sanitizedRequest.messages.map((message) => message.content), ["[REDACTED]", "[REDACTED]"]);

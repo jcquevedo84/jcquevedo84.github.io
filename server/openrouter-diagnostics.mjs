@@ -1,5 +1,4 @@
-import { randomUUID } from "node:crypto";
-
+const encoder = new TextEncoder();
 const MAX_DIAGNOSTIC_TEXT = 600;
 const MAX_DIAGNOSTIC_JSON = 2_400;
 const SENSITIVE_FIELD = /(authorization|api.?key|token|secret|password|credential|hash|user.?id|workspace.?id|prompt|document|knowledge|content)/i;
@@ -104,7 +103,7 @@ export function createOpenRouterDiagnostics({
   enabled = false,
   logger = console,
   now = () => Date.now(),
-  correlationIdFactory = randomUUID,
+  correlationIdFactory = () => globalThis.crypto.randomUUID(),
 } = {}) {
   function emit(record) {
     if (!enabled) return;
@@ -126,7 +125,7 @@ export function createOpenRouterDiagnostics({
         model: body.model,
         contentType: headers["Content-Type"],
         authorizationPresent: Boolean(headers.Authorization),
-        requestBodyBytes: Buffer.byteLength(bodyText),
+        requestBodyBytes: encoder.encode(bodyText).byteLength,
         messageCount: messages.length,
         messageRoles: messages.map((message) => message.role),
         messageCharacterLengths: messages.map((message) => String(message.content ?? "").length),
