@@ -1,7 +1,8 @@
 import { createServer } from "node:http";
+import { MissingConversationConfigurationError } from "./chat-service.mjs";
 import { MissingProviderConfigurationError, OpenRouterError } from "./openrouter-client.mjs";
 import { isAllowedOrigin } from "./security.mjs";
-import { REQUEST_LIMITS, RequestValidationError } from "./validation.mjs";
+import { ConversationContextError, REQUEST_LIMITS, RequestValidationError } from "./validation.mjs";
 
 class PayloadTooLargeError extends Error {}
 class BodyReadTimeoutError extends Error {}
@@ -307,6 +308,8 @@ export function createDigitalTwinHttpServer({ config, chatService, rateLimiter, 
       const requestOrigin = typeof request.headers.origin === "string" ? request.headers.origin.replace(/\/$/, "") : null;
       origin = isAllowedOrigin(requestOrigin, config.allowedOrigins) ? requestOrigin : null;
       const pathname = requestPath(method, request.url);
+      const continuationRoute = pathname === "/v2/chat";
+      const chatRoute = continuationRoute || pathname === "/v1/chat";
 
       if (method === "GET" && pathname === "/health") {
         const configurationIssues = [];
@@ -321,7 +324,7 @@ export function createDigitalTwinHttpServer({ config, chatService, rateLimiter, 
         return;
       }
 
-      if (method === "OPTIONS" && pathname === "/v1/chat") {
+      if (method === "OPTIONS" && chatRoute) {
         if (!origin) {
           reply(403, { error: { code: "origin_not_allowed", message: "This origin is not allowed." } });
           return;
@@ -341,7 +344,7 @@ export function createDigitalTwinHttpServer({ config, chatService, rateLimiter, 
         return;
       }
 
-      if (method !== "POST" || pathname !== "/v1/chat") {
+      if (method !== "POST" || !chatRoute) {
         reply(404, { error: { code: "not_found", message: "Endpoint not found." } });
         return;
       }
@@ -378,9 +381,11 @@ export function createDigitalTwinHttpServer({ config, chatService, rateLimiter, 
 
       const payload = await readJsonBody(request, signal, bodyTimeoutMs);
       signal.throwIfAborted();
-      const message = await chatService.answer(payload?.messages, { signal });
+      const result = continuationRoute
+        ? await chatService.answerWithContext(payload, { signal })
+        : { message: await chatService.answer(payload?.messages, { signal }) };
       signal.throwIfAborted();
-      sendJson(response, 200, { message }, origin);
+      sendJson(response, 200, result, origin);
     } catch (error) {
       if (signal.aborted || !canStartResponse(response)) {
         closeUnfinished(response);
@@ -398,7 +403,12 @@ export function createDigitalTwinHttpServer({ config, chatService, rateLimiter, 
       }
 
       if (error instanceof RequestValidationError) {
-        reply(400, { error: { code: error.code, message: error.message } });
+        reply(error instanceof ConversationContextError ? error.status : 400, { error: { code: error.code, message: error.message } });
+        return;
+      }
+
+      if (error instanceof MissingConversationConfigurationError) {
+        reply(503, { error: { code: "conversation_unavailable", message: error.message } });
         return;
       }
 

@@ -1,16 +1,8 @@
 "use client";
 
-import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
-import {
-  requestDigitalTwinAnswer,
-  type DigitalTwinMessage,
-  type DigitalTwinRole,
-} from "@/lib/digital-twin-api";
-
-type UiMessage = DigitalTwinMessage & {
-  id: string;
-  welcome?: boolean;
-};
+import { FormEvent, KeyboardEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { MAX_QUESTION_UNITS, requestDigitalTwinAnswer } from "@/lib/digital-twin-api";
+import { createDigitalTwinConversation } from "@/lib/digital-twin-conversation";
 
 const WELCOME_MESSAGE =
   "Hello — I’m JC’s AI Digital Twin. I can answer questions about Juan Carlos’s documented professional background, engineering experience, education, and technical approach.";
@@ -25,36 +17,20 @@ const SUGGESTED_QUESTIONS = [
   "What technologies and skills are you currently learning?",
 ];
 
-function createMessage(role: DigitalTwinRole, content: string, welcome = false): UiMessage {
-  return {
-    id: typeof crypto !== "undefined" && "randomUUID" in crypto
-      ? crypto.randomUUID()
-      : `${Date.now()}-${Math.random()}`,
-    role,
-    content,
-    welcome,
-  };
-}
-
-function initialMessages(): UiMessage[] {
-  return [createMessage("assistant", WELCOME_MESSAGE, true)];
-}
-
 export function DigitalTwin() {
   const [open, setOpen] = useState(false);
   const [contactVisible, setContactVisible] = useState(false);
   const [heroActionsVisible, setHeroActionsVisible] = useState(false);
   const [portraitVisible, setPortraitVisible] = useState(false);
-  const [messages, setMessages] = useState<UiMessage[]>(initialMessages);
+  const [conversation] = useState(() => createDigitalTwinConversation(requestDigitalTwinAnswer, WELCOME_MESSAGE));
+  const { messages, loading, error, canRetry } = useSyncExternalStore(
+    conversation.subscribe, conversation.getSnapshot, conversation.getSnapshot,
+  );
   const [draft, setDraft] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [lastQuestion, setLastQuestion] = useState<string | null>(null);
   const panelRef = useRef<HTMLElement>(null);
   const launcherRef = useRef<HTMLButtonElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
-  const requestControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -99,7 +75,7 @@ export function DigitalTwin() {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [messages, loading, error, open]);
 
-  useEffect(() => () => requestControllerRef.current?.abort(), []);
+  useEffect(() => () => conversation.cancel(), [conversation]);
 
   useEffect(() => {
     const contact = document.querySelector("#contact");
@@ -137,59 +113,27 @@ export function DigitalTwin() {
     return () => observer.disconnect();
   }, []);
 
-  const submitQuestion = async (question: string, appendQuestion = true) => {
-    const normalizedQuestion = question.trim();
-    if (!normalizedQuestion || loading) return;
-
-    setError(null);
-    setLastQuestion(normalizedQuestion);
+  const submitQuestion = (question: string) => {
+    if (!question.trim() || conversation.getSnapshot().loading) return;
     setDraft("");
-
-    const nextMessages = appendQuestion
-      ? [...messages, createMessage("user", normalizedQuestion)]
-      : messages;
-    if (appendQuestion) setMessages(nextMessages);
-
-    const history = nextMessages
-      .filter((message) => !message.welcome)
-      .slice(-10)
-      .map(({ role, content }) => ({ role, content }));
-
-    const controller = new AbortController();
-    requestControllerRef.current = controller;
-    setLoading(true);
-
-    try {
-      const answer = await requestDigitalTwinAnswer(history, controller.signal);
-      setMessages((current) => [...current, createMessage("assistant", answer)]);
-    } catch (requestError) {
-      if (controller.signal.aborted) return;
-      setError(requestError instanceof Error ? requestError.message : "The Digital Twin is temporarily unavailable.");
-    } finally {
-      if (requestControllerRef.current === controller) requestControllerRef.current = null;
-      setLoading(false);
-    }
+    void conversation.submit(question);
   };
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    void submitQuestion(draft);
+    submitQuestion(draft);
   };
 
   const handleInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === "Enter" && !event.shiftKey) {
+    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
-      void submitQuestion(draft);
+      submitQuestion(draft);
     }
   };
 
   const startNewConversation = () => {
-    requestControllerRef.current?.abort();
-    setMessages(initialMessages());
+    conversation.reset();
     setDraft("");
-    setError(null);
-    setLastQuestion(null);
-    setLoading(false);
     window.setTimeout(() => inputRef.current?.focus(), 0);
   };
 
@@ -248,7 +192,7 @@ export function DigitalTwin() {
               <div className="twin-suggestions" aria-label="Suggested questions">
                 <p>Suggested recruiter questions</p>
                 {SUGGESTED_QUESTIONS.map((question) => (
-                  <button type="button" key={question} disabled={loading} onClick={() => void submitQuestion(question)}>
+                  <button type="button" key={question} disabled={loading} onClick={() => submitQuestion(question)}>
                     {question}<span aria-hidden="true">→</span>
                   </button>
                 ))}
@@ -264,7 +208,7 @@ export function DigitalTwin() {
             {error && (
               <div className="twin-error" role="alert">
                 <p>{error}</p>
-                {lastQuestion && <button type="button" onClick={() => void submitQuestion(lastQuestion, false)}>Retry</button>}
+                {canRetry && <button type="button" onClick={() => void conversation.retry()}>Retry</button>}
               </div>
             )}
             <div ref={endRef} />
@@ -276,7 +220,7 @@ export function DigitalTwin() {
               ref={inputRef}
               id="twin-question"
               value={draft}
-              maxLength={2000}
+              maxLength={MAX_QUESTION_UNITS}
               rows={2}
               disabled={loading}
               placeholder="Ask about experience, architecture, payments, or leadership…"

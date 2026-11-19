@@ -5,12 +5,62 @@ export const REQUEST_LIMITS = Object.freeze({
   maximumBodyBytes: 24_000,
 });
 
+export const MAX_CONTINUATION_BYTES = 10_000;
+export const CONVERSATION_ID_PATTERN = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
+
 export class RequestValidationError extends Error {
   constructor(message, code = "invalid_request") {
     super(message);
     this.name = "RequestValidationError";
     this.code = code;
   }
+}
+
+export class ConversationContextError extends RequestValidationError {
+  constructor(expired = false) {
+    super(
+      expired
+        ? "This conversation context has expired. Retry to send your question without the previous context."
+        : "This conversation context could not be verified. Retry to send your question without the previous context.",
+      expired ? "conversation_context_expired" : "invalid_conversation_context",
+    );
+    this.name = "ConversationContextError";
+    this.status = expired ? 409 : 400;
+  }
+}
+
+function validateContent(value) {
+  if (typeof value !== "string") {
+    throw new RequestValidationError("Every message must contain text.");
+  }
+  const content = value.trim();
+  if (!content) throw new RequestValidationError("Empty messages are not accepted.");
+  if (content.length > REQUEST_LIMITS.maximumMessageCharacters) {
+    throw new RequestValidationError(`Messages are limited to ${REQUEST_LIMITS.maximumMessageCharacters} characters.`);
+  }
+  return content;
+}
+
+function hasOnlyKeys(value, allowed) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).every((key) => allowed.includes(key));
+}
+
+export function validateConversationRequest(value) {
+  if (!hasOnlyKeys(value, ["question", "conversation"]) || !Object.hasOwn(value, "question")) {
+    throw new RequestValidationError("Send a question and optional signed conversation context.");
+  }
+  const question = validateContent(value.question);
+  if (!Object.hasOwn(value, "conversation")) return { question };
+
+  const { conversation } = value;
+  if (!hasOnlyKeys(conversation, ["id", "token"])
+    || typeof conversation.id !== "string" || !CONVERSATION_ID_PATTERN.test(conversation.id)
+    || typeof conversation.token !== "string" || conversation.token.length > MAX_CONTINUATION_BYTES
+    || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/.test(conversation.token)) {
+    throw new ConversationContextError();
+  }
+  return { question, conversation };
 }
 
 export function validateMessages(value) {
@@ -32,15 +82,7 @@ export function validateMessages(value) {
       throw new RequestValidationError("Only user and assistant messages are accepted.");
     }
 
-    if (typeof message.content !== "string") {
-      throw new RequestValidationError("Every message must contain text.");
-    }
-
-    const content = message.content.trim();
-    if (!content) throw new RequestValidationError("Empty messages are not accepted.");
-    if (content.length > REQUEST_LIMITS.maximumMessageCharacters) {
-      throw new RequestValidationError(`Messages are limited to ${REQUEST_LIMITS.maximumMessageCharacters} characters.`);
-    }
+    const content = validateContent(message.content);
 
     totalCharacters += content.length;
     return { role: message.role, content };

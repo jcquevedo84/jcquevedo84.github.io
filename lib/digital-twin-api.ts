@@ -5,13 +5,21 @@ export type DigitalTwinMessage = {
   content: string;
 };
 
-type ChatResponse = {
-  message?: DigitalTwinMessage;
-  error?: {
-    code?: string;
-    message?: string;
-  };
+export type DigitalTwinContext = { id: string; token: string };
+
+export type DigitalTwinRequest = {
+  question: string;
+  conversation?: DigitalTwinContext;
 };
+
+export type DigitalTwinAnswer = {
+  message: { role: "assistant"; content: string };
+  conversation: DigitalTwinContext;
+};
+
+export const MAX_QUESTION_UNITS = 2_000;
+const MAX_REQUEST_BYTES = 24_000;
+const MAX_CONTEXT_BYTES = 10_000;
 
 const SAFE_API_ERRORS: Record<string, string> = {
   service_not_configured: "The Digital Twin service configuration is incomplete.",
@@ -31,7 +39,23 @@ const SAFE_API_ERRORS: Record<string, string> = {
   provider_invalid_response: "The AI service returned an unusable response. Please retry.",
   rate_limited: "Too many requests. Please wait before trying again.",
   origin_not_allowed: "The Digital Twin backend rejected this website origin.",
+  conversation_unavailable: "The Digital Twin conversation service is not configured.",
+  conversation_context_expired: "The conversation context expired. Retry to send your question without the earlier context.",
+  invalid_conversation_context: "The conversation context could not be verified. Retry to send your question without the earlier context.",
+  invalid_request: "The Digital Twin could not accept this question.",
+  payload_too_large: "The Digital Twin request is too large.",
+  request_body_timeout: "The request took too long to reach the Digital Twin. Please retry.",
 };
+
+export class DigitalTwinApiError extends Error {
+  readonly code?: string;
+
+  constructor(message: string, code?: string) {
+    super(message);
+    this.name = "DigitalTwinApiError";
+    this.code = code;
+  }
+}
 
 export function resolveDigitalTwinApiBaseUrl(): string | null {
   const configuredUrl = process.env.NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL?.trim();
@@ -48,38 +72,73 @@ export function resolveDigitalTwinApiBaseUrl(): string | null {
 }
 
 export async function requestDigitalTwinAnswer(
-  messages: DigitalTwinMessage[],
+  request: DigitalTwinRequest,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<DigitalTwinAnswer> {
+  signal?.throwIfAborted();
   const apiBaseUrl = resolveDigitalTwinApiBaseUrl();
   if (!apiBaseUrl) {
     throw new Error("The Digital Twin API has not been configured for this environment.");
   }
 
+  const question = request.question.trim();
+  if (!question || question.length > MAX_QUESTION_UNITS) {
+    throw new DigitalTwinApiError(SAFE_API_ERRORS.invalid_request, "invalid_request");
+  }
+  const { conversation } = request;
+  if (conversation !== undefined && !isContext(conversation)) {
+    throw new DigitalTwinApiError(SAFE_API_ERRORS.invalid_conversation_context, "invalid_conversation_context");
+  }
+  const body = JSON.stringify({ question, conversation: conversation && { id: conversation.id, token: conversation.token } });
+  if (new TextEncoder().encode(body).byteLength > MAX_REQUEST_BYTES) {
+    throw new DigitalTwinApiError(SAFE_API_ERRORS.payload_too_large, "payload_too_large");
+  }
+
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl}/v1/chat`, {
+    response = await fetch(`${apiBaseUrl}/v2/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages }),
+      body,
       signal,
     });
   } catch (error) {
+    signal?.throwIfAborted();
     if (error instanceof DOMException && error.name === "AbortError") throw error;
     throw new Error("The Digital Twin backend is unavailable. Confirm the local API is running and retry.");
   }
 
-  let payload: ChatResponse;
+  let payload: unknown;
   try {
-    payload = (await response.json()) as ChatResponse;
+    payload = await response.json();
   } catch {
+    signal?.throwIfAborted();
     throw new Error("The Digital Twin returned an unreadable response.");
   }
+  signal?.throwIfAborted();
 
-  if (!response.ok || !payload.message?.content) {
-    const safeMessage = payload.error?.code ? SAFE_API_ERRORS[payload.error.code] : null;
-    throw new Error(safeMessage || payload.error?.message || "The Digital Twin is temporarily unavailable.");
+  if (!response.ok) {
+    const error = isRecord(payload) && isRecord(payload.error) ? payload.error : null;
+    const code = typeof error?.code === "string" && Object.hasOwn(SAFE_API_ERRORS, error.code) ? error.code : undefined;
+    throw new DigitalTwinApiError(code ? SAFE_API_ERRORS[code] : "The Digital Twin is temporarily unavailable.", code);
   }
+  if (!isRecord(payload) || !isRecord(payload.message) || payload.message.role !== "assistant"
+    || typeof payload.message.content !== "string" || !payload.message.content.trim()
+    || !isContext(payload.conversation) || (conversation && payload.conversation.id !== conversation.id)) {
+    throw new DigitalTwinApiError("The Digital Twin returned an invalid conversation response.");
+  }
+  return {
+    message: { role: "assistant", content: payload.message.content },
+    conversation: { id: payload.conversation.id, token: payload.conversation.token },
+  };
+}
 
-  return payload.message.content;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isContext(value: unknown): value is DigitalTwinContext {
+  return isRecord(value) && typeof value.id === "string" && typeof value.token === "string"
+    && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value.id)
+    && value.token.length <= MAX_CONTEXT_BYTES && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/.test(value.token);
 }

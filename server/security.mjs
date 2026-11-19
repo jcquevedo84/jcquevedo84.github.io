@@ -8,12 +8,49 @@ const SENSITIVE_EXTRACTION_PATTERNS = [
   /ignora (todas |las )?(instrucciones|reglas) (anteriores|previas)/i,
   /(revelar|mostrar|imprimir|repetir).*(instrucciones internas|credenciales|clave de api|secretos|base de conocimiento|documentos fuente)/i,
   /(instrucciones internas|base de conocimiento completa).*(revelar|mostrar|imprimir|repetir)/i,
+  /(?:switch|change|replace|overwrite) (?:your |the )?(?:professional )?(?:identity|persona)/i,
+  /(?:cambia|reemplaza|sobrescribe) (?:tu |la )?identidad(?: profesional)?/i,
 ];
 
-const SPANISH_MARKERS = /\b(qué|cuál|cómo|experiencia|educación|tecnologías|puedes|háblame|dime|proyectos|liderazgo)\b/i;
+const SPANISH_MARKERS = /(?:^|[^\p{L}])(?:qué|cuál|cómo|experiencia|educación|tecnologías|puedes|háblame|dime|proyectos|liderazgo|ignora|revela|cambia|reemplaza|sobrescribe|instrucciones)(?=$|[^\p{L}])/iu;
+
+const SENSITIVE_CONTEXT_PATTERNS = [
+  /\b(?:sk-or-v1-|sk-(?:proj-|svcacct-)?|gh[pousr]_)[\w-]{16,}/i,
+  /\bBearer\s+[\w.+/=-]{12,}/i,
+  /\b(?:OPENROUTER|DIGITAL_TWIN)_[A-Z0-9_]+\b/i,
+  /\b(?:[A-Z0-9_]+_)?(?:API_KEY|SIGNING_KEY|PASSWORD|SECRET|ACCESS_TOKEN)\s*[:=]/i,
+  /-----BEGIN [^-]*PRIVATE KEY-----/i,
+  /<\/?professional_knowledge>|\b(?:private|confidential|privado|privada|confidencial) (?:source |internal )?(?:document|file|documento|archivo)\b/i,
+];
 
 export function isSensitiveExtractionAttempt(text) {
-  return SENSITIVE_EXTRACTION_PATTERNS.some((pattern) => pattern.test(text));
+  const normalized = text.trim().replace(/\s+/gu, " ");
+  return SENSITIVE_EXTRACTION_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+export function containsSensitiveContext(text, systemPrompt = "") {
+  if (SENSITIVE_CONTEXT_PATTERNS.some((pattern) => pattern.test(text))) return true;
+  if (!systemPrompt) return false;
+
+  const normalized = text.toLowerCase().replace(/\s+/gu, " ");
+  return systemPrompt.split("\n").some((line) => {
+    const instruction = line.replace(/^\d+\.\s*/, "").trim().toLowerCase();
+    return instruction.length >= 48 && normalized.includes(instruction);
+  });
+}
+
+function unsafeConversationText(text) {
+  return isSensitiveExtractionAttempt(text) || containsSensitiveContext(text);
+}
+
+export function reviewConversation(question, exchanges) {
+  const priorQuestions = exchanges.map(({ question: prior }) => prior);
+  const unsafeHistory = priorQuestions.some(unsafeConversationText)
+    || unsafeConversationText(priorQuestions.join(" "))
+    || exchanges.some(({ answer }) => unsafeConversationText(answer));
+  const retained = unsafeHistory ? [] : exchanges;
+  const recentQuestions = unsafeHistory ? [] : priorQuestions;
+  return { retained, refuse: unsafeConversationText([...recentQuestions, question].join(" ")) };
 }
 
 export function safeExtractionRefusal(text) {

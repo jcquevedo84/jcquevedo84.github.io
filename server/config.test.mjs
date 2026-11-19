@@ -1,6 +1,30 @@
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import test from "node:test";
 import { isZeroCostOpenRouterModel, loadConfig } from "./config.mjs";
+import { createConversationContext } from "./conversation-context.mjs";
+
+test("conversation signing configuration is independent of the provider key and rejects obvious placeholders", async () => {
+  const providerOnly = loadConfig({ OPENROUTER_API_KEY: randomBytes(32).toString("hex") });
+  assert.equal(providerOnly.conversationSigningKey, "");
+  assert.equal(await createConversationContext(providerOnly.conversationSigningKey), null);
+  assert.equal(await createConversationContext(randomBytes(31).toString("hex")), null);
+  assert.equal(await createConversationContext("ab".repeat(32)), null);
+  assert.equal(await createConversationContext("not a hexadecimal key"), null);
+
+  const signingKey = randomBytes(32).toString("hex");
+  assert.equal(loadConfig({
+    OPENROUTER_API_KEY: signingKey,
+    DIGITAL_TWIN_CONVERSATION_SIGNING_KEY: signingKey,
+  }).conversationSigningKey, "");
+  const configured = loadConfig({
+    OPENROUTER_API_KEY: providerOnly.provider.apiKey,
+    DIGITAL_TWIN_CONVERSATION_SIGNING_KEY: signingKey,
+  });
+  assert.ok(configured.conversationSigningKey === signingKey);
+  assert.equal(Object.hasOwn(configured.provider, "conversationSigningKey"), false);
+  assert.ok(await createConversationContext(configured.conversationSigningKey));
+});
 
 test("configuration uses OPENROUTER_MODEL exactly as provided", () => {
   const config = loadConfig({

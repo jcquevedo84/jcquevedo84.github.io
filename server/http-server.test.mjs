@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { createServer, request as httpRequest } from "node:http";
 import test from "node:test";
 import { createChatService } from "./chat-service.mjs";
+import { createConversationContext } from "./conversation-context.mjs";
 import { createDigitalTwinHttpServer } from "./http-server.mjs";
 import { createOpenRouterClient, MissingProviderConfigurationError, OpenRouterError } from "./openrouter-client.mjs";
 import { InMemoryRateLimiter } from "./security.mjs";
@@ -523,4 +525,136 @@ test("chat endpoint rejects invalid requests and enforces local rate limiting", 
   } finally {
     await instance.close();
   }
+});
+
+function postJson(api, version, payload) {
+  return fetch(`${api.url}/${version}/chat`, {
+    method: "POST", headers: chatHeaders, body: JSON.stringify(payload),
+  });
+}
+
+test("V2 is unavailable without a valid signing key, while V1 keeps its shape and ignores prior messages", { timeout: 5_000 }, async (t) => {
+  const continuation = await createConversationContext("00".repeat(32));
+  const calls = [];
+  const api = await startTestServer(createChatService({
+    continuation, selectTopics: () => [],
+    providerClient: { complete(_prompt, messages) { calls.push(messages); return "Synthetic answer."; } },
+  }));
+  t.after(api.close);
+
+  const v2 = await postJson(api, "v2", { question: "Question" });
+  assert.equal(v2.status, 503);
+  assert.equal(v2.headers.get("access-control-allow-origin"), allowedOrigin);
+  assert.deepEqual(await v2.json(), {
+    error: { code: "conversation_unavailable", message: "The Digital Twin conversation service is not configured." },
+  });
+  assert.equal(calls.length, 0);
+
+  const latest = { role: "user", content: "Latest question" };
+  const v1 = await postJson(api, "v1", { messages: [
+    { role: "assistant", content: "Synthetic client-authored reply." }, latest,
+  ] });
+  assert.equal(v1.status, 200);
+  assert.deepEqual(await v1.json(), { message: { role: "assistant", content: "Synthetic answer." } });
+  assert.deepEqual(calls, [[latest]]);
+});
+
+test("V2 returns verified context and shares CORS, byte limits, and rate limiting with V1", { timeout: 5_000 }, async (t) => {
+  const continuation = await createConversationContext(randomBytes(32).toString("hex"));
+  const api = await startTestServer(createChatService({
+    continuation, selectTopics: () => [],
+    providerClient: { complete: () => "A synthetic response." },
+  }), { maximumRequests: 2 });
+  t.after(api.close);
+
+  const preflight = await fetch(`${api.url}/v2/chat`, { method: "OPTIONS", headers: { Origin: allowedOrigin } });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get("access-control-allow-origin"), allowedOrigin);
+  const first = await postJson(api, "v2", { question: "First question" });
+  assert.equal(first.status, 200);
+  assert.equal(first.headers.get("cache-control"), "no-store");
+  const result = await first.json();
+  assert.deepEqual(result.message, { role: "assistant", content: "A synthetic response." });
+  assert.deepEqual(await continuation.verify(result.conversation), [{ question: "First question", answer: "A synthetic response." }]);
+
+  const oversize = startHttpRequest(`${api.url}/v2/chat`, {
+    method: "POST", headers: { ...chatHeaders, "Content-Length": REQUEST_LIMITS.maximumBodyBytes + 1 },
+  }, (request) => request.flushHeaders());
+  assert.equal((await oversize.response).status, 413);
+
+  const limited = await postJson(api, "v1", { messages: [{ role: "user", content: "Question" }] });
+  assert.equal(limited.status, 429);
+  assert.equal((await limited.json()).error.code, "rate_limited");
+  assert.ok(Number(limited.headers.get("retry-after")) > 0);
+});
+
+test("V2 rejects invalid and expired continuation over HTTP before any extra provider call", { timeout: 5_000 }, async (t) => {
+  let now = 20_000;
+  let calls = 0;
+  const continuation = await createConversationContext(randomBytes(32).toString("hex"), { now: () => now });
+  const api = await startTestServer(createChatService({
+    continuation, selectTopics: () => [],
+    providerClient: { complete() { calls += 1; return "Synthetic answer."; } },
+  }));
+  t.after(api.close);
+
+  const first = await postJson(api, "v2", { question: "First question" });
+  const { conversation } = await first.json();
+  const mismatched = await postJson(api, "v2", {
+    question: "Next question", conversation: { ...conversation, id: continuation.newId() },
+  });
+  assert.equal(mismatched.status, 400);
+  assert.equal((await mismatched.json()).error.code, "invalid_conversation_context");
+
+  now += 30 * 60 * 1_000;
+  const expired = await postJson(api, "v2", { question: "Next question", conversation });
+  assert.equal(expired.status, 409);
+  assert.equal((await expired.json()).error.code, "conversation_context_expired");
+  assert.equal(calls, 1);
+});
+
+test("V2 aborts suspended inference on disconnect and the previous signed context can still be retried", { timeout: 5_000 }, async (t) => {
+  const continuation = await createConversationContext(randomBytes(32).toString("hex"));
+  const started = notification();
+  const cancelled = notification();
+  let calls = 0;
+  const api = await startTestServer(createChatService({
+    continuation, selectTopics: () => [],
+    providerClient: {
+      complete(_prompt, messages, { signal }) {
+        calls += 1;
+        if (calls === 1) return "Fixture answer.";
+        assert.deepEqual(messages.map(({ content }) => content), ["First question", "Fixture answer.", "Follow-up"]);
+        if (calls !== 2) return "Retry answer.";
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            cancelled.resolve();
+            reject(signal.reason);
+          }, { once: true });
+          started.resolve();
+        });
+      },
+    },
+  }));
+  t.after(api.close);
+
+  const first = await postJson(api, "v2", { question: "First question" });
+  const { conversation } = await first.json();
+  const payload = { question: "Follow-up", conversation };
+  const pending = startHttpRequest(`${api.url}/v2/chat`, {
+    method: "POST", headers: chatHeaders,
+  }, (request) => request.end(JSON.stringify(payload)));
+  const rejected = assert.rejects(pending.response, { code: "ECONNRESET" });
+  await started.promise;
+  pending.request.destroy();
+  await rejected;
+  await cancelled.promise;
+
+  const retry = await postJson(api, "v2", payload);
+  assert.equal(retry.status, 200);
+  const result = await retry.json();
+  assert.equal(result.conversation.id, conversation.id);
+  assert.deepEqual((await continuation.verify(result.conversation)).map(({ question }) => question),
+    ["First question", "Follow-up"]);
+  assert.equal(calls, 3);
 });

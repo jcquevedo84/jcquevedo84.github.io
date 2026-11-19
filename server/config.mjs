@@ -16,18 +16,21 @@ export function loadConfig(environment = process.env) {
     ?.split(",")
     .map((origin) => origin.trim().replace(/\/$/, ""))
     .filter(Boolean);
+  const apiKey = environment.OPENROUTER_API_KEY?.trim() || "";
+  const signingKey = environment.DIGITAL_TWIN_CONVERSATION_SIGNING_KEY?.trim() || "";
 
   return {
     port: boundedInteger(environment.DIGITAL_TWIN_PORT, 8787, 1024, 65535),
     host: environment.DIGITAL_TWIN_HOST?.trim() || "127.0.0.1",
     allowedOrigins: new Set(configuredOrigins?.length ? configuredOrigins : DEFAULT_ORIGINS),
     trustProxy: environment.DIGITAL_TWIN_TRUST_PROXY === "true",
+    conversationSigningKey: signingKey === apiKey ? "" : signingKey,
     rateLimit: {
       requests: boundedInteger(environment.DIGITAL_TWIN_RATE_LIMIT_REQUESTS, 8, 1, 100),
       windowMs: boundedInteger(environment.DIGITAL_TWIN_RATE_LIMIT_WINDOW_MS, 600_000, 10_000, 3_600_000),
     },
     provider: {
-      apiKey: environment.OPENROUTER_API_KEY?.trim() || "",
+      apiKey,
       apiUrl: environment.OPENROUTER_API_URL?.trim() || "https://openrouter.ai/api/v1/chat/completions",
       model: environment.OPENROUTER_MODEL?.trim() || "",
       debug: environment.OPENROUTER_DEBUG === "true",

@@ -1,30 +1,167 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
-import { requestDigitalTwinAnswer } from "../lib/digital-twin-api.ts";
+import { DigitalTwinApiError, requestDigitalTwinAnswer } from "../lib/digital-twin-api.ts";
+import { createDigitalTwinConversation } from "../lib/digital-twin-conversation.ts";
 
-test("frontend API client preserves the complete backend answer without truncation", async () => {
+function useApiFixture(t, fetchImpl) {
   const previousBaseUrl = process.env.NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL;
   const previousFetch = globalThis.fetch;
+  process.env.NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL = "https://api.test.invalid";
+  globalThis.fetch = fetchImpl;
+  t.after(() => {
+    globalThis.fetch = previousFetch;
+    if (previousBaseUrl === undefined) delete process.env.NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL;
+    else process.env.NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL = previousBaseUrl;
+  });
+}
+
+function context(id = crypto.randomUUID(), label = "fixture") {
+  return { id, token: `${label}.${"x".repeat(43)}` };
+}
+
+function answer(content, conversation = context()) {
+  return { message: { role: "assistant", content }, conversation };
+}
+
+function widgetFixture() {
+  const calls = [];
+  const widget = createDigitalTwinConversation((request, signal) => new Promise((resolve, reject) => {
+    calls.push({ request, signal, resolve, reject });
+  }), "Welcome");
+  return { widget, calls };
+}
+
+test("frontend API client preserves the complete backend answer without truncation", async (t) => {
   const completeAnswer = [
     "Formal education: Ingeniería de Sistemas.",
     "Postgraduate education: Maestría en Ingeniería de Sistemas.",
     "Current learning: AI-assisted coding and Blockchain/Web3 training.",
+    "Respuesta completa 👩‍💻.".repeat(150),
   ].join("\n\n");
+  const result = answer(completeAnswer);
+  useApiFixture(t, async (url, options) => {
+    assert.equal(url, "https://api.test.invalid/v2/chat");
+    assert.deepEqual(JSON.parse(options.body), { question: "Education and learning?" });
+    return Response.json(result);
+  });
+  assert.deepEqual(await requestDigitalTwinAnswer({ question: "Education and learning?" }), result);
+});
 
-  process.env.NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL = "https://api.test.invalid";
-  globalThis.fetch = async () => new Response(JSON.stringify({
-    message: { role: "assistant", content: completeAnswer },
-  }), { status: 200, headers: { "Content-Type": "application/json" } });
+test("frontend sends the latest Unicode question and bounded continuation without reserializing the transcript", async (t) => {
+  const conversation = context();
+  conversation.token = `${"a".repeat(9_956)}.${"x".repeat(43)}`;
+  const question = "¿" + "\u0001".repeat(1_995) + "👩?";
+  useApiFixture(t, async (_url, options) => {
+    assert.ok(Buffer.byteLength(options.body) <= 24_000);
+    assert.deepEqual(JSON.parse(options.body), { question, conversation });
+    return Response.json(answer("Continuación.", { ...conversation, token: context().token }));
+  });
+  assert.equal((await requestDigitalTwinAnswer({ question, conversation })).message.content, "Continuación.");
+});
 
-  try {
-    const answer = await requestDigitalTwinAnswer([{ role: "user", content: "Education and learning?" }]);
-    assert.equal(answer, completeAnswer);
-  } finally {
-    globalThis.fetch = previousFetch;
-    if (previousBaseUrl === undefined) delete process.env.NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL;
-    else process.env.NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL = previousBaseUrl;
+test("frontend rejects malformed or mismatched response envelopes and displays a fixed expiry message", async (t) => {
+  const conversation = context();
+  const fixtures = [
+    () => Response.json(null),
+    () => Response.json({ ...answer("Reply", conversation), message: { role: "user", content: "Wrong role" } }),
+    () => Response.json(answer("Reply", context())),
+    () => Response.json({ error: { code: "conversation_context_expired", message: "UNTRUSTED SERVER TEXT" } }, { status: 409 }),
+  ];
+  useApiFixture(t, async () => fixtures.shift()());
+
+  for (let i = 0; i < 3; i += 1) {
+    await assert.rejects(requestDigitalTwinAnswer({ question: "Question", conversation }), /invalid conversation response/);
   }
+  await assert.rejects(
+    requestDigitalTwinAnswer({ question: "Question", conversation }),
+    { code: "conversation_context_expired", message: "The conversation context expired. Retry to send your question without the earlier context." },
+  );
+});
+
+test("Retry preserves the latest committed context and never duplicates the displayed user turn", async () => {
+  const { widget, calls } = widgetFixture();
+  const first = widget.submit("First");
+  const firstContext = context();
+  const longAnswer = "a".repeat(2_300);
+  calls[0].resolve(answer(longAnswer, firstContext));
+  await first;
+
+  const second = widget.submit("Follow-up");
+  calls[1].reject(new Error("Temporary failure"));
+  await second;
+  assert.equal(widget.getSnapshot().canRetry, true);
+
+  const retry = widget.retry();
+  await widget.retry();
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[2].request, { question: "Follow-up", conversation: firstContext });
+  const nextContext = context(firstContext.id, "next");
+  calls[2].resolve(answer("Follow-up answer", nextContext));
+  await retry;
+
+  assert.deepEqual(widget.getSnapshot().messages.map(({ content }) => content),
+    ["Welcome", "First", longAnswer, "Follow-up", "Follow-up answer"]);
+  const next = widget.submit("Next");
+  assert.deepEqual(calls[3].request, { question: "Next", conversation: nextContext });
+  calls[3].resolve(answer("Done", nextContext));
+  await next;
+});
+
+test("expired context recovers with a fresh manual Retry and keeps the displayed transcript", async () => {
+  const { widget, calls } = widgetFixture();
+  const first = widget.submit("First");
+  calls[0].resolve(answer("Old answer"));
+  await first;
+  const followUp = widget.submit("Same question");
+  calls[1].reject(new DigitalTwinApiError("Context expired. Retry without the earlier context.", "conversation_context_expired"));
+  await followUp;
+  assert.match(widget.getSnapshot().error, /without the earlier context/);
+  assert.equal(calls.length, 2);
+
+  const retry = widget.retry();
+  assert.deepEqual(calls[2].request, { question: "Same question" });
+  calls[2].resolve(answer("Fresh answer"));
+  await retry;
+  assert.deepEqual(widget.getSnapshot().messages.map(({ content }) => content),
+    ["Welcome", "First", "Old answer", "Same question", "Fresh answer"]);
+});
+
+test("New Conversation aborts and ignores stale success, failure, and loading updates", async () => {
+  const { widget, calls } = widgetFixture();
+  for (const method of ["resolve", "reject"]) {
+    const stale = widget.submit("Old question");
+    const oldCall = calls.at(-1);
+    widget.reset();
+    assert.equal(oldCall.signal.aborted, true);
+    const current = widget.submit("New question");
+    const currentCall = calls.at(-1);
+    assert.deepEqual(currentCall.request, { question: "New question" });
+    oldCall[method](method === "resolve" ? answer("Stale response") : new Error("Stale error"));
+    await stale;
+    assert.equal(widget.getSnapshot().loading, true);
+    assert.equal(widget.getSnapshot().error, null);
+    assert.deepEqual(widget.getSnapshot().messages.map(({ content }) => content), ["Welcome", "New question"]);
+    currentCall.resolve(answer("New answer"));
+    await current;
+    widget.reset();
+  }
+});
+
+test("cancellation keeps the pending question retryable and discards late continuation state", async () => {
+  const { widget, calls } = widgetFixture();
+  const initial = widget.submit("Pending question");
+  widget.cancel();
+  assert.equal(calls[0].signal.aborted, true);
+  assert.equal(widget.getSnapshot().loading, false);
+  assert.equal(widget.getSnapshot().canRetry, true);
+  calls[0].resolve(answer("Late result"));
+  await initial;
+  const retry = widget.retry();
+  assert.deepEqual(calls[1].request, { question: "Pending question" });
+  calls[1].resolve(answer("Current result"));
+  await retry;
+  assert.deepEqual(widget.getSnapshot().messages.map(({ content }) => content), ["Welcome", "Pending question", "Current result"]);
 });
 
 test("frontend message rendering preserves whitespace and has no line clamp", async () => {
