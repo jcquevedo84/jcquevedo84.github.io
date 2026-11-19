@@ -1,112 +1,14 @@
 import assert from "node:assert/strict";
-import { randomBytes, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
-import miniflare from "miniflare";
 import { createConversationContext } from "../server/conversation-context.mjs";
 import { REQUEST_LIMITS } from "../server/validation.mjs";
-
-const root = fileURLToPath(new URL("../", import.meta.url));
-const runtimeConfig = JSON.parse(await readFile(join(root, "wrangler.jsonc"), "utf8"));
-const modulePaths = [
-  runtimeConfig.main,
-  "worker/config.mjs",
-  "server/chat-service.mjs",
-  "server/config.mjs",
-  "server/conversation-context.mjs",
-  "server/http-errors.mjs",
-  "server/knowledge-base.mjs",
-  "server/openrouter-client.mjs",
-  "server/openrouter-diagnostics.mjs",
-  "server/prompt.mjs",
-  "server/security.mjs",
-  "server/validation.mjs",
-];
-const modules = Object.fromEntries(await Promise.all(modulePaths.map(async (path) => [
-  path, { type: "esm", contents: await readFile(join(root, path), "utf8") },
-])));
-const origin = "http://localhost:3000";
-const chatHeaders = { Origin: origin, "Content-Type": "application/json" };
-const providerKey = "worker-test-provider-canary";
-const providerModel = "synthetic/test-model";
-const providerUrl = "http://127.0.0.1:9999/chat";
-const { Miniflare } = miniflare;
-
-function jsonResponse(response, body, status = 200, headers = {}) {
-  response.writeHead(status, { "Content-Type": "application/json", ...headers });
-  response.end(typeof body === "string" ? body : JSON.stringify(body));
-}
-
-function completion(content) {
-  return { choices: [{ message: { content }, finish_reason: "stop" }] };
-}
-
-async function startWorker(t, { bindings = {}, mock = (response) => jsonResponse(response, completion("Synthetic reply.")) } = {}) {
-  const calls = [];
-  const logs = [];
-  let rejectedOutboundRequests = 0;
-  const signingKey = randomBytes(32).toString("hex");
-  const variables = {
-    DIGITAL_TWIN_CONVERSATION_SIGNING_KEY: signingKey,
-    OPENROUTER_API_KEY: providerKey,
-    OPENROUTER_API_URL: providerUrl,
-    OPENROUTER_MODEL: providerModel,
-    OPENROUTER_TIMEOUT_MS: "3000",
-    ...bindings,
-  };
-
-  async function handleProvider(request, response) {
-    const url = new URL(request.url, providerUrl);
-    if (url.href !== providerUrl || request.method !== "POST") {
-      rejectedOutboundRequests += 1;
-      response.writeHead(502).end();
-      return;
-    }
-    try {
-      const chunks = [];
-      for await (const chunk of request) chunks.push(chunk);
-      calls.push({ headers: request.headers, body: JSON.parse(Buffer.concat(chunks)) });
-      mock(response, calls.length);
-    } catch {
-      response.destroy();
-    }
-  }
-
-  const worker = new Miniflare({
-    host: "127.0.0.1",
-    port: 0,
-    cf: false,
-    enableDevRegistry: false,
-    telemetry: { enabled: false },
-    handleStructuredLogs: (entry) => logs.push(entry),
-    workers: [{
-      config: {
-        name: runtimeConfig.name,
-        compatibilityDate: runtimeConfig.compatibility_date,
-        compatibilityFlags: runtimeConfig.compatibility_flags,
-        manifest: { mainModule: runtimeConfig.main, modulesRoot: root, modules },
-        env: Object.fromEntries(Object.entries(variables).map(([name, value]) => [name, { type: "text", value }])),
-      },
-      dev: {
-        outboundService: { type: "node-handler", handler: handleProvider },
-        // Connect directly to workerd so socket lifecycle tests exercise the runtime listener.
-        unsafeDirectSockets: [{ host: "127.0.0.1", port: 0 }],
-      },
-    }],
-  });
-  t.after(() => worker.dispose());
-  const url = await worker.unsafeGetDirectURL();
-  const fetchRoute = (path, init) => fetch(new URL(path, url), init);
-  const chat = (payload) => fetchRoute("/v2/chat", { method: "POST", headers: chatHeaders, body: JSON.stringify(payload) });
-  return {
-    url, calls, logs, fetchRoute, chat, signingKey,
-    get rejectedOutboundRequests() { return rejectedOutboundRequests; },
-  };
-}
+import { chatHeaders, completion, jsonResponse, origin, providerKey, providerModel, providerName, runtimeConfig, startWorker, turnstileKey, verification } from "./test-fixture.mjs";
 
 async function assertError(response, status, code) {
   assert.equal(response.status, status);
@@ -120,7 +22,7 @@ async function assertError(response, status, code) {
 function rawChat(t, url, write) {
   const request = httpRequest(new URL("/v2/chat", url), {
     method: "POST",
-    headers: chatHeaders,
+    headers: chatHeaders(),
     signal: AbortSignal.timeout(13_000),
   });
   t.after(() => request.destroy());
@@ -173,7 +75,7 @@ test("workerd routes V2, handles allowed preflight, and rejects invalid origins 
   assert.equal(preflight.body, null);
   assert.equal(preflight.headers.get("access-control-allow-origin"), origin);
   assert.equal(preflight.headers.get("access-control-allow-methods"), "POST, OPTIONS");
-  assert.equal(preflight.headers.get("access-control-allow-headers"), "Content-Type");
+  assert.equal(preflight.headers.get("access-control-allow-headers"), "Content-Type, X-Digital-Twin-Challenge");
   assert.equal(preflight.headers.get("access-control-max-age"), "600");
   assert.equal(preflight.headers.get("vary"), "Origin");
   for (const headers of [{}, { Origin: "https://untrusted.example.invalid" }, { Origin: "null" }]) {
@@ -187,13 +89,13 @@ test("workerd routes V2, handles allowed preflight, and rejects invalid origins 
     body: "{}",
   });
   await assertError(deniedPost, 403, "origin_not_allowed");
-  await assertError(await fetchRoute("/v1/chat", { method: "POST", headers: chatHeaders }), 404, "not_found");
-  await assertError(await fetchRoute("/v2/chat", { headers: chatHeaders }), 404, "not_found");
-  await assertError(await fetchRoute("/v2/chat?q=%ZZ", { method: "POST", headers: chatHeaders }), 400, "invalid_request_target");
+  await assertError(await fetchRoute("/v1/chat", { method: "POST", headers: chatHeaders() }), 404, "not_found");
+  await assertError(await fetchRoute("/v2/chat", { headers: chatHeaders() }), 404, "not_found");
+  await assertError(await fetchRoute("/v2/chat?q=%ZZ", { method: "POST", headers: chatHeaders() }), 400, "invalid_request_target");
   await assertError(await fetchRoute("/v2/chat", {
-    method: "POST", headers: { Origin: origin, "Content-Type": "text/plain" }, body: "{}",
+    method: "POST", headers: { ...chatHeaders(), "Content-Type": "text/plain" }, body: "{}",
   }), 415, "unsupported_media_type");
-  await assertError(await fetchRoute("/v2/chat", { method: "POST", headers: chatHeaders, body: "{" }), 400, "invalid_json");
+  await assertError(await fetchRoute("/v2/chat", { method: "POST", headers: chatHeaders(), body: "{" }), 400, "invalid_json");
   assert.equal(calls.length, 0);
 });
 
@@ -234,6 +136,10 @@ test("workerd preserves the V2 contract, Unicode, and multi-turn HMAC interopera
     { role: "user", content: nextQuestion },
   ]);
   assert.equal(calls[1].body.model, providerModel);
+  assert.deepEqual(calls[1].body.provider, {
+    only: [providerName], zdr: true, data_collection: "deny", allow_fallbacks: false,
+    max_price: { prompt: 0, completion: 0, request: 0 },
+  });
   assert.equal(calls[1].headers.authorization, `Bearer ${providerKey}`);
 });
 
@@ -260,7 +166,7 @@ test("workerd accepts exactly 24,000 bytes and rejects declared and streamed ove
   const body = JSON.stringify({ question });
   const exact = body.padEnd(REQUEST_LIMITS.maximumBodyBytes - Buffer.byteLength(body) + body.length);
   assert.equal(Buffer.byteLength(exact), REQUEST_LIMITS.maximumBodyBytes);
-  const send = (body) => fetchRoute("/v2/chat", { method: "POST", headers: chatHeaders, body });
+  const send = (body) => fetchRoute("/v2/chat", { method: "POST", headers: chatHeaders(), body });
   assert.equal((await send(exact)).status, 200);
   await assertError(await send(`${exact} `), 413, "payload_too_large");
 
@@ -341,7 +247,9 @@ test("workerd enforces provider deadlines through headers and complete response 
 
 test("workerd cancels provider I/O when the HTTP client disconnects after a complete upload", { timeout: 8_000 }, async (t) => {
   const upstream = stalledProvider(true);
-  const { url, chat, calls } = await startWorker(t, {
+  const { url, chat, calls, workerd } = await startWorker(t, {
+    bindings: { DIGITAL_TWIN_MAX_CONCURRENT: "1" },
+    controlledClock: true,
     mock: (response, call) => call === 1 ? upstream.mock(response) : jsonResponse(response, completion("Recovered.")),
   });
   const pending = rawChat(t, url, (request) => request.end(JSON.stringify({ question: "Question" })));
@@ -359,22 +267,28 @@ test("workerd cancels provider I/O when the HTTP client disconnects after a comp
   } finally {
     deadline.abort();
   }
+  await assertError(await chat({ question: "Follow-up" }), 429, "capacity");
+  const namespace = await workerd.getDurableObjectNamespace("ADMISSION");
+  const admission = namespace.get(namespace.idFromName("digital-twin-global"));
+  await admission.setClock(Date.now() + 14_000);
   assert.equal((await chat({ question: "Follow-up" })).status, 200);
   assert.equal(calls.length, 2);
+  const storage = await workerd.unsafeGetDurableObjectStorage(runtimeConfig.name, "InferenceAdmission", { name: "digital-twin-global" });
+  assert.equal((await storage.exec("SELECT COUNT(*) AS total FROM inference_attempts"))[0].total, 2);
 });
 
-test("workerd keeps missing or nonlocal provider configuration and secret details out of responses", async (t) => {
-  const signingMissing = await startWorker(t, { bindings: { DIGITAL_TWIN_CONVERSATION_SIGNING_KEY: "" } });
+test("workerd keeps missing or unsafe provider configuration and secret details out of responses", async (t) => {
+  const signingMissing = await startWorker(t, { bindings: { DIGITAL_TWIN_CONVERSATION_SIGNING_KEY: "malformed" } });
   await assertError(await signingMissing.chat({ question: "Question" }), 503, "conversation_unavailable");
   assert.equal(signingMissing.calls.length, 0);
 
-  const nonlocal = await startWorker(t, { bindings: { OPENROUTER_API_URL: "https://openrouter.ai/api/v1/chat/completions" } });
-  await assertError(await nonlocal.chat({ question: "Question" }), 503, "service_not_configured");
-  assert.equal(nonlocal.calls.length, 0);
-  assert.equal(nonlocal.rejectedOutboundRequests, 0);
+  const noRoute = await startWorker(t, { omit: ["OPENROUTER_ALLOWED_PROVIDERS"] });
+  await assertError(await noRoute.chat({ question: "Question" }), 503, "protection_unavailable");
+  assert.equal(noRoute.calls.length, 0);
+  assert.equal(noRoute.verifications.length, 0);
 });
 
-test("workerd does not follow fixture redirects or forward credentials to a redirect destination", async (t) => {
+test("workerd does not follow OpenRouter redirects or forward credentials to a redirect destination", async (t) => {
   const worker = await startWorker(t, {
     mock(response) {
       response.writeHead(307, { Location: "https://provider-redirect.example.invalid/" }).end();
@@ -383,4 +297,183 @@ test("workerd does not follow fixture redirects or forward credentials to a redi
   await assertError(await worker.chat({ question: "Question" }), 502, "provider_error");
   assert.equal(worker.calls.length, 1);
   assert.equal(worker.rejectedOutboundRequests, 0);
+});
+
+test("workerd fails closed on disabled, missing, or invalid protection configuration", async (t) => {
+  const cases = [
+    { name: "disabled switch", bindings: { DIGITAL_TWIN_INFERENCE_ENABLED: "false" }, code: "inference_disabled" },
+    { name: "absent switch", omit: ["DIGITAL_TWIN_INFERENCE_ENABLED"], code: "inference_disabled" },
+    { name: "missing edge limiter", omit: ["CHAT_RATE_LIMITER"] },
+    { name: "missing admission binding", omit: ["ADMISSION"] },
+    { name: "missing Turnstile secret", omit: ["TURNSTILE_SECRET_KEY"] },
+    { name: "missing OpenRouter key", omit: ["OPENROUTER_API_KEY"] },
+    { name: "reused secret", bindings: { TURNSTILE_SECRET_KEY: providerKey } },
+    { name: "paid model", bindings: { OPENROUTER_MODEL: "unreviewed/paid-model" } },
+    { name: "invalid daily limit", bindings: { DIGITAL_TWIN_DAILY_LIMIT: "-1" } },
+  ];
+  for (const { name, code = "protection_unavailable", ...options } of cases) {
+    await t.test(name, async (t) => {
+      const worker = await startWorker(t, options);
+      await assertError(await worker.chat({ question: "Question" }), 503, code);
+      assert.equal(worker.calls.length, 0);
+      assert.equal(worker.verifications.length, 0);
+    });
+  }
+});
+
+test("workerd issues no provider calls when admission storage cannot load", { timeout: 12_000 }, async (t) => {
+  const persistencePath = await mkdtemp(join(tmpdir(), "digital-twin-invalid-schema-"));
+  const worker = await startWorker(t, { controlledClock: true, persistencePath });
+  const storage = await worker.workerd.unsafeGetDurableObjectStorage(
+    runtimeConfig.name, "InferenceAdmission", { name: "digital-twin-global" },
+  );
+  await storage.exec("UPDATE admission_schema SET version = 99");
+  await worker.stop();
+  const restarted = await startWorker(t, { persistencePath });
+  t.after(() => rm(persistencePath, { recursive: true, force: true }));
+  const error = await assertError(await restarted.chat({ question: "Synthetic question" }), 503, "protection_unavailable");
+  assert.ok(!error.includes("schema"));
+  assert.equal(restarted.calls.length, 0);
+});
+
+test("workerd rejects missing edge metadata and ignores forwarding headers for its native rate bucket", async (t) => {
+  const worker = await startWorker(t, { rateLimit: 2 });
+  const missingIp = chatHeaders();
+  delete missingIp["CF-Connecting-IP"];
+  missingIp["X-Forwarded-For"] = "192.0.2.20";
+  await assertError(await worker.chat({ question: "Question" }, missingIp), 403, "client_identity_unavailable");
+  const missingEdge = chatHeaders();
+  delete missingEdge["MF-CF-Blob"];
+  await assertError(await worker.chat({ question: "Question" }, missingEdge), 403, "client_identity_unavailable");
+  for (const address of ["192.0.2.10, 192.0.2.20", "2a06:98c0:3600::103", "999.0.2.10"]) {
+    await assertError(await worker.chat({ question: "Question" }, { ...chatHeaders(), "CF-Connecting-IP": address }), 403, "client_identity_unavailable");
+  }
+  assert.equal(worker.verifications.length, 0);
+  assert.equal(worker.calls.length, 0);
+  for (let index = 1; index <= 2; index += 1) {
+    const response = await worker.chat({ question: "Question" }, { ...chatHeaders(), "X-Forwarded-For": `192.0.2.${index}` });
+    assert.equal(response.status, 200);
+    await response.json();
+  }
+  const limited = await worker.chat({ question: "Question" }, { ...chatHeaders(), "X-Real-IP": "192.0.2.30" });
+  assert.equal(limited.headers.get("retry-after"), "60");
+  assert.equal(limited.headers.get("access-control-expose-headers"), "Retry-After");
+  await assertError(limited, 429, "rate_limited");
+  assert.equal(worker.verifications.length, 2);
+  assert.equal(worker.calls.length, 2);
+});
+
+test("workerd verifies bounded Turnstile responses and fails closed on bad tokens, hostname, action, or verifier errors", { timeout: 12_000 }, async (t) => {
+  const variants = [
+    { body: { success: false, "error-codes": ["invalid-input-response"] }, status: 403, code: "challenge_invalid" },
+    { body: { success: false, "error-codes": ["timeout-or-duplicate"] }, status: 403, code: "challenge_expired_or_replayed" },
+    { body: verification({ challenge_ts: new Date(Date.now() - 301_000).toISOString() }), status: 403, code: "challenge_expired_or_replayed" },
+    { body: verification({ hostname: "wrong.example.invalid" }), status: 403, code: "challenge_invalid" },
+    { body: verification({ action: "other" }), status: 403, code: "challenge_invalid" },
+    { body: { success: false, "error-codes": ["invalid-input-secret"] }, status: 503, code: "protection_unavailable" },
+    { upstreamStatus: 429, body: { error: `synthetic ${turnstileKey}` }, status: 503, code: "protection_unavailable" },
+    { body: "{}", status: 503, code: "protection_unavailable" },
+    { body: JSON.stringify(verification()).padEnd(16_385), status: 503, code: "protection_unavailable" },
+    { stall: true, status: 503, code: "protection_unavailable" },
+  ];
+  const worker = await startWorker(t, {
+    rateLimit: 60,
+    mockVerification(response, count) {
+      const entry = variants[count - 1];
+      if (entry.stall) {
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.write('{"success":');
+      } else jsonResponse(response, entry.body, entry.upstreamStatus);
+    },
+  });
+  const missing = chatHeaders();
+  delete missing["X-Digital-Twin-Challenge"];
+  await assertError(await worker.chat({ question: "Question" }, missing), 400, "challenge_required");
+  for (const token of ["two,tokens", "a".repeat(2_049)]) {
+    await assertError(await worker.chat({ question: "Question" }, chatHeaders(token)), 400, "challenge_required");
+  }
+  assert.equal(worker.verifications.length, 0);
+  for (const { status, code } of variants) {
+    const message = await assertError(await worker.chat({ question: "Synthetic question" }), status, code);
+    assert.ok(!message.includes(turnstileKey));
+  }
+  assert.equal(worker.verifications.length, variants.length);
+  assert.equal(worker.verifications[0].body.secret, turnstileKey);
+  assert.equal(Object.hasOwn(worker.verifications[0].body, "remoteip"), false);
+  assert.equal(worker.calls.length, 0);
+  assert.ok(!JSON.stringify(worker.logs).includes(turnstileKey));
+});
+
+test("workerd grants at most one call when concurrent Siteverify requests both succeed for one token", async (t) => {
+  const waiting = [];
+  const worker = await startWorker(t, {
+    controlledClock: true,
+    mockVerification(response) {
+      waiting.push(response);
+      if (waiting.length === 2) {
+        for (const pending of waiting) jsonResponse(pending, verification());
+      }
+    },
+  });
+  const token = "synthetic-replayed-challenge";
+  const challenge = chatHeaders(token);
+  const responses = await Promise.all([
+    worker.chat({ question: "First question" }, challenge),
+    worker.chat({ question: "Second question" }, challenge),
+  ]);
+  assert.deepEqual(responses.map(({ status }) => status).sort(), [200, 403]);
+  await assertError(responses.find(({ status }) => status === 403), 403, "challenge_expired_or_replayed");
+  assert.equal(worker.verifications.length, 2);
+  assert.equal(worker.calls.length, 1);
+  const storage = await worker.workerd.unsafeGetDurableObjectStorage(
+    runtimeConfig.name, "InferenceAdmission", { name: "digital-twin-global" },
+  );
+  const claims = await storage.exec("SELECT digest FROM challenge_claims");
+  assert.deepEqual(Array.from(claims, ({ digest }) => digest), [createHash("sha256").update(token).digest("hex")]);
+  assert.ok(!JSON.stringify(worker.logs).includes(token));
+});
+
+test("workerd rejects an unacknowledged reservation without dispatching or refunding it", async (t) => {
+  const worker = await startWorker(t, {
+    controlledClock: true,
+    bindings: { DIGITAL_TWIN_DAILY_LIMIT: "1" },
+  });
+  const namespace = await worker.workerd.getDurableObjectNamespace("ADMISSION");
+  const admission = namespace.get(namespace.idFromName("digital-twin-global"));
+  await admission.delayNextGrant(2_000);
+  await assertError(await worker.chat({ question: "First question" }), 503, "protection_unavailable");
+  await assertError(await worker.chat({ question: "Second question" }), 429, "daily_limit");
+  assert.equal(worker.calls.length, 0);
+});
+
+test("workerd does not refund a failed provider attempt or retry on a missing eligible route", async (t) => {
+  const worker = await startWorker(t, {
+    bindings: { DIGITAL_TWIN_DAILY_LIMIT: "1" },
+    mock: (response) => jsonResponse(response, { error: { message: "No privacy-eligible synthetic endpoint." } }, 404),
+  });
+  await assertError(await worker.chat({ question: "First question" }), 503, "provider_model_unavailable");
+  await assertError(await worker.chat({ question: "Second question" }), 429, "daily_limit");
+  assert.equal(worker.calls.length, 1);
+  assert.equal(worker.rejectedOutboundRequests, 0);
+});
+
+test("workerd keeps provider concurrency at two while both calls are open", { timeout: 7_000 }, async (t) => {
+  const open = [];
+  const bothStarted = notification();
+  const worker = await startWorker(t, {
+    mock(response) {
+      open.push(response);
+      if (open.length === 2) bothStarted.resolve();
+    },
+  });
+  const pending = ["First question", "Second question"].map((question) => worker.chat({ question }));
+  try {
+    await bothStarted.promise;
+    await assertError(await worker.chat({ question: "Third question" }), 429, "capacity");
+    assert.equal(worker.calls.length, 2);
+  } finally {
+    for (const response of open) jsonResponse(response, completion("Finished."));
+    await Promise.allSettled(pending);
+  }
+  assert.ok((await Promise.all(pending)).every(({ status }) => status === 200));
 });

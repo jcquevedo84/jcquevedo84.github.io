@@ -41,6 +41,20 @@ test("OpenRouter client uses the configured endpoint, model, limits, and backend
   assert.equal(captured.body.stream, false);
   assert.equal(captured.body.max_completion_tokens, 321);
   assert.equal(captured.body.messages[0].role, "system");
+  assert.equal(Object.hasOwn(captured.body, "provider"), false);
+});
+
+test("OpenRouter forwards an explicit server-supplied provider policy", async () => {
+  const routingPolicy = { only: ["fixture"], zdr: true, data_collection: "deny", allow_fallbacks: false, max_price: { prompt: 0, completion: 0, request: 0 } };
+  const client = createOpenRouterClient({
+    ...baseConfiguration,
+    routingPolicy,
+    fetchImpl: async (_url, { body }) => {
+      assert.deepEqual(JSON.parse(body).provider, routingPolicy);
+      return Response.json({ choices: [{ message: { content: "Synthetic reply." } }] });
+    },
+  });
+  assert.equal(await client.complete("System", [{ role: "user", content: "Question" }]), "Synthetic reply.");
 });
 
 test("OpenRouter client rejects missing backend configuration before making a request", async () => {

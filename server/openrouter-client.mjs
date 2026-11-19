@@ -201,6 +201,7 @@ export function createOpenRouterClient({
   timeoutMs,
   siteUrl,
   title,
+  routingPolicy,
   fetchImpl = globalThis.fetch,
   logger = console,
   now = () => Date.now(),
@@ -236,6 +237,7 @@ export function createOpenRouterClient({
         temperature: 0.2,
         max_completion_tokens: maxCompletionTokens,
         stream: false,
+        ...(routingPolicy ? { provider: routingPolicy } : {}),
       };
       const bodyText = JSON.stringify(body);
       const startedAt = now();

@@ -44,6 +44,7 @@ async function fixture(t, digitalTwinEnabled = true) {
         NEXT_PUBLIC_DIGITAL_TWIN_ENABLED: digitalTwinEnabled ? "" : "false",
         OPENROUTER_API_KEY: "",
         DIGITAL_TWIN_CONVERSATION_SIGNING_KEY: "",
+        TURNSTILE_SECRET_KEY: "",
         ...env,
       },
     });
@@ -64,7 +65,7 @@ test("static verification passes with a complete export and requires no credenti
 
 test("static verification distinguishes backend variable names from leaked values and patterns", async (t) => {
   const { write, verify } = await fixture(t);
-  await write("names.txt", "OPENROUTER_API_KEY DIGITAL_TWIN_CONVERSATION_SIGNING_KEY");
+  await write("names.txt", "OPENROUTER_API_KEY DIGITAL_TWIN_CONVERSATION_SIGNING_KEY TURNSTILE_SECRET_KEY");
   const namesOnly = verify();
   assert.equal(namesOnly.status, 1);
   assert.match(namesOnly.stdout, /^server_only_name_matches=1$/m);
@@ -72,21 +73,26 @@ test("static verification distinguishes backend variable names from leaked value
 
   await write("provider.txt", openRouterMarker);
   await write("signing.txt", signingMarker);
+  await write("turnstile.txt", "static-test-turnstile-canary");
   await write("pattern.txt", "sk-or-v1-synthetic-privacy-test");
   const secrets = verify({
     OPENROUTER_API_KEY: openRouterMarker,
     DIGITAL_TWIN_CONVERSATION_SIGNING_KEY: signingMarker,
+    TURNSTILE_SECRET_KEY: "static-test-turnstile-canary",
   });
   assert.equal(secrets.status, 1);
-  assert.match(secrets.stdout, /^credential_values_provided=2$/m);
-  assert.match(secrets.stdout, /^credential_value_matches=2$/m);
+  assert.match(secrets.stdout, /^credential_values_provided=3$/m);
+  assert.match(secrets.stdout, /^credential_value_matches=3$/m);
   assert.match(secrets.stdout, /^credential_pattern_matches=1$/m);
-  assert.doesNotMatch(secrets.stdout + secrets.stderr, /static-test-(?:provider|signing)-canary|sk-or-v1-synthetic-privacy-test/);
+  assert.doesNotMatch(secrets.stdout + secrets.stderr, /static-test-(?:provider|signing|turnstile)-canary|sk-or-v1-synthetic-privacy-test/);
 });
 
 test("static verification rejects private paths, documents, and filesystem links", async (t) => {
   const { cwd, write, verify } = await fixture(t);
   await write(".env.local", "fixture");
+  await write(".dev.vars.local", "fixture");
+  await write(".wrangler/state/file", "fixture");
+  await write("worker/index.mjs", "fixture");
   await write("nested/resource/private.txt", "fixture");
   await write("server/index.mjs", "fixture");
   await write("node_modules/package/index.js", "fixture");
@@ -97,7 +103,7 @@ test("static verification rejects private paths, documents, and filesystem links
   await link(join(cwd, "external.txt"), join(cwd, "out", "hardlink.txt"));
   const result = verify();
   assert.equal(result.status, 1);
-  assert.match(result.stdout, /^private_paths=4$/m);
+  assert.match(result.stdout, /^private_paths=7$/m);
   assert.match(result.stdout, /^private_document_files=1$/m);
   assert.match(result.stdout, /^unsafe_entries=2$/m);
   assert.match(result.stdout, /^forbidden_content_matches=1$/m);

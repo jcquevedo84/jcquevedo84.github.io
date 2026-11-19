@@ -3,13 +3,133 @@ import { createConversationContext } from "../server/conversation-context.mjs";
 import { providerFailure } from "../server/http-errors.mjs";
 import { createOpenRouterClient } from "../server/openrouter-client.mjs";
 import { isAllowedOrigin } from "../server/security.mjs";
-import { ConversationContextError, REQUEST_LIMITS, RequestValidationError } from "../server/validation.mjs";
+import { CONVERSATION_ID_PATTERN, ConversationContextError, REQUEST_LIMITS, RequestValidationError, validateConversationRequest } from "../server/validation.mjs";
+import { ADMISSION_OBJECT_NAME } from "./admission.mjs";
 import { loadWorkerConfig } from "./config.mjs";
+import { isChallengeToken, verifyTurnstile } from "./turnstile.mjs";
+
+export { InferenceAdmission } from "./admission.mjs";
 
 const BODY_READ_TIMEOUT_MS = 10_000;
+const BINDING_TIMEOUT_MS = 1_500;
+const encoder = new TextEncoder();
 
 class PayloadTooLargeError extends Error {}
 class BodyReadTimeoutError extends Error {}
+
+class ProtectionError extends Error {
+  constructor(status, code, message, retryAfter) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.headers = retryAfter ? { "Retry-After": String(retryAfter) } : {};
+  }
+}
+
+function protectionUnavailable() {
+  return new ProtectionError(503, "protection_unavailable", "The Digital Twin is temporarily unavailable.");
+}
+
+function challengeRejected(outcome) {
+  return ["expired", "replay"].includes(outcome)
+    ? new ProtectionError(403, "challenge_expired_or_replayed", "Please complete a fresh challenge.")
+    : new ProtectionError(403, "challenge_invalid", "The challenge could not be verified.");
+}
+
+function rejectAdmission(result) {
+  const { outcome, retryAfter } = result ?? {};
+  if (outcome === "replay" || outcome === "expired") throw challengeRejected(outcome);
+  if (["claim_limit", "daily_limit", "minute_limit", "capacity"].includes(outcome)
+    && Number.isSafeInteger(retryAfter) && retryAfter >= 1 && retryAfter <= 86_400) {
+    throw new ProtectionError(429, outcome, "The Digital Twin is busy. Please try again later.", retryAfter);
+  }
+  throw protectionUnavailable();
+}
+
+function trustedClientAddress(request) {
+  if (!request.cf?.colo || request.headers.has("CF-Worker")) return null;
+  const address = request.headers.get("CF-Connecting-IP");
+  if (!address) return null;
+  if (/^(?:0|[1-9]\d{0,2})(?:\.(?:0|[1-9]\d{0,2})){3}$/.test(address)) {
+    return address.split(".").every((piece) => Number(piece) <= 255) ? address : null;
+  }
+  if (!address.includes(":") || !/^[\da-f:.]+$/i.test(address)) return null;
+  const hostname = URL.parse(`http://[${address}]`)?.hostname;
+  if (!hostname || hostname === "[2a06:98c0:3600::103]") return null;
+  return hostname;
+}
+
+async function callBinding(operation, signal) {
+  signal?.throwIfAborted();
+  let timer;
+  let abort;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(protectionUnavailable()), BINDING_TIMEOUT_MS);
+    abort = () => reject(signal.reason);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+  try {
+    return await Promise.race([deadline, Promise.resolve().then(operation)]);
+  } catch {
+    signal?.throwIfAborted();
+    throw protectionUnavailable();
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+function recordOutcome(outcome, status, startedAt) {
+  const durationBucketMs = Math.max(0, Math.min(120_000, Math.ceil((Date.now() - startedAt) / 100) * 100));
+  console.info(JSON.stringify({ event: "digital_twin.request", outcome, status, durationBucketMs }));
+}
+
+function protectedProvider(config, admission, digest, context) {
+  return {
+    async complete(systemPrompt, messages, { signal }) {
+      const grant = await callBinding(() => admission.admit(digest), signal);
+      if (grant?.outcome !== "admitted") rejectAdmission(grant);
+      const { leaseId, startBy, expiresAt } = grant;
+      if (typeof leaseId !== "string" || !CONVERSATION_ID_PATTERN.test(leaseId)
+        || !Number.isSafeInteger(startBy) || !Number.isSafeInteger(expiresAt)) {
+        throw protectionUnavailable();
+      }
+
+      let dispatched = false;
+      let completed = false;
+      let staleGrant = false;
+      const provider = createOpenRouterClient({
+        ...config,
+        fetchImpl(url, options) {
+          options.signal.throwIfAborted();
+          const now = Date.now();
+          if (now >= startBy || now + config.timeoutMs >= expiresAt) {
+            staleGrant = true;
+            throw protectionUnavailable();
+          }
+          dispatched = true;
+          return fetch(url, { ...options, redirect: "manual" });
+        },
+      });
+      try {
+        const response = await provider.complete(systemPrompt, messages, { signal });
+        completed = true;
+        return response;
+      } catch (error) {
+        signal?.throwIfAborted();
+        if (staleGrant) throw protectionUnavailable();
+        throw error;
+      } finally {
+        // A failed call may still be running upstream. Keep its lease until expiry.
+        if (completed || !dispatched) {
+          context.waitUntil(callBinding(() => admission.release(leaseId)).catch(() => {
+            console.info(JSON.stringify({ event: "digital_twin.lease_release_failed" }));
+          }));
+        }
+      }
+    },
+  };
+}
 
 function json(status, payload, origin, additionalHeaders = {}) {
   const headers = new Headers({
@@ -20,6 +140,7 @@ function json(status, payload, origin, additionalHeaders = {}) {
   });
   if (origin) {
     headers.set("Access-Control-Allow-Origin", origin);
+    headers.set("Access-Control-Expose-Headers", "Retry-After");
     headers.set("Vary", "Origin");
   }
   return new Response(JSON.stringify(payload), { status, headers });
@@ -103,9 +224,10 @@ async function readJsonBody(request) {
 }
 
 export default {
-  async fetch(request, environment) {
+  async fetch(request, environment, context) {
     let origin = null;
     const { signal } = request;
+    const startedAt = Date.now();
 
     try {
       const config = loadWorkerConfig(environment);
@@ -129,32 +251,61 @@ export default {
           headers: {
             "Access-Control-Allow-Origin": origin,
             "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
+            "Access-Control-Allow-Headers": "Content-Type, X-Digital-Twin-Challenge",
             "Access-Control-Max-Age": "600",
             Vary: "Origin",
           },
         });
       }
 
+      if (!config.enabled) throw new ProtectionError(503, "inference_disabled", "The Digital Twin is currently unavailable.");
+      if (!config.configured || typeof environment.CHAT_RATE_LIMITER?.limit !== "function"
+        || typeof environment.ADMISSION?.getByName !== "function" || typeof context?.waitUntil !== "function") {
+        throw protectionUnavailable();
+      }
       const mediaType = request.headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase();
       if (mediaType !== "application/json") {
         return errorJson(415, "unsupported_media_type", "Content-Type must be application/json.", origin);
       }
 
-      const payload = await readJsonBody(request);
-      signal.throwIfAborted();
+      validateContentLength(request.headers);
+      const address = trustedClientAddress(request);
+      if (!address) throw new ProtectionError(403, "client_identity_unavailable", "The request could not be verified.");
+      const rate = await callBinding(() => environment.CHAT_RATE_LIMITER.limit({ key: address }), signal);
+      if (rate?.success === false) {
+        throw new ProtectionError(429, "rate_limited", "Too many requests. Please wait before trying again.", 60);
+      }
+      if (rate?.success !== true) throw protectionUnavailable();
+
+      const token = request.headers.get("X-Digital-Twin-Challenge");
+      if (!isChallengeToken(token)) {
+        throw new ProtectionError(400, "challenge_required", "Complete a fresh challenge before sending a question.");
+      }
+      const payload = validateConversationRequest(await readJsonBody(request));
       const continuation = await createConversationContext(config.conversationSigningKey);
-      const providerClient = createOpenRouterClient({
-        ...config.provider,
-        fetchImpl: (url, options) => fetch(url, { ...options, redirect: "manual" }),
-      });
+      if (!continuation) throw new MissingConversationConfigurationError();
+
+      const verification = await verifyTurnstile(token, config.turnstile, signal);
+      if (verification.outcome === "unavailable") throw protectionUnavailable();
+      if (verification.outcome !== "verified") throw challengeRejected(verification.outcome);
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(token))).toHex();
+      const admission = environment.ADMISSION.getByName(ADMISSION_OBJECT_NAME);
+      const claim = await callBinding(() => admission.claim(digest, verification.issuedAt), signal);
+      if (claim?.outcome !== "claimed") rejectAdmission(claim);
+
+      const providerClient = protectedProvider(config.provider, admission, digest, context);
       const chatService = createChatService({ providerClient, continuation });
       const answer = await chatService.answerWithContext(payload, { signal });
       signal.throwIfAborted();
+      recordOutcome("answered", 200, startedAt);
       return json(200, answer, origin);
     } catch (error) {
       // A disconnect leaves no client to receive the response.
       if (signal.aborted) return new Response(null, { status: 499 });
+      if (error instanceof ProtectionError) {
+        recordOutcome(error.code, error.status, startedAt);
+        return json(error.status, { error: { code: error.code, message: error.message } }, origin, error.headers);
+      }
       if (error instanceof PayloadTooLargeError) {
         return errorJson(413, "payload_too_large", "The request is too large.", origin);
       }
@@ -169,7 +320,10 @@ export default {
         return errorJson(503, "conversation_unavailable", error.message, origin);
       }
       const failure = providerFailure(error);
-      if (failure) return json(failure.status, failure.payload, origin, failure.headers);
+      if (failure) {
+        recordOutcome(failure.payload.error.code, failure.status, startedAt);
+        return json(failure.status, failure.payload, origin, failure.headers);
+      }
       return errorJson(500, "internal_error", "The Digital Twin encountered an unexpected error.", origin);
     }
   },

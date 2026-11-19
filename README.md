@@ -45,9 +45,9 @@ The signing key must contain 32–64 cryptographically random bytes encoded as h
 
 The combined command checks ports 3000 and 8787 first and stops without killing an existing process when either port is occupied.
 
-### Local Cloudflare Worker compatibility
+### Local protected Cloudflare Worker
 
-Use the Node.js API above for normal local Digital Twin development. The Phase 1 Worker provides a separate Fetch adapter for `GET /health`, `OPTIONS /v2/chat`, and `POST /v2/chat`. It shares the chat service, validation, knowledge selection, signed continuations, and OpenRouter client with Node.js.
+Use the Node.js API above for normal local Digital Twin development. The protected Worker provides a separate Fetch adapter for `GET /health`, `OPTIONS /v2/chat`, and `POST /v2/chat`. It shares the chat service, validation, knowledge selection, signed continuations, and OpenRouter client with Node.js.
 
 ```bash
 nvm use
@@ -55,7 +55,7 @@ npm ci
 npm run test:worker
 ```
 
-The tests run the Worker in `workerd` through Miniflare. They generate synthetic bindings, call a controlled loopback provider, and block external fetches. Neither the frontend nor the Node.js API needs to be running.
+The tests run the Worker and its SQLite-backed Durable Object in `workerd` through Miniflare. They use synthetic bindings and intercept all outbound requests to the Turnstile and OpenRouter endpoints. Neither the frontend nor the Node.js API needs to be running.
 
 To start the standalone Worker for a local health check:
 
@@ -66,9 +66,23 @@ CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV=false CLOUDFLARE_INCLUDE_PROCESS_ENV=false
 curl --fail http://127.0.0.1:8788/health
 ```
 
-Use an isolated checkout with no local secret files for the Wrangler command. The Worker accepts only an explicit HTTP fixture URL on `127.0.0.1` with an unprivileged port and does not follow provider redirects. Use the integration suite to exercise chat with synthetic bindings. The local health check needs no bindings.
+Use an isolated checkout with no local secret files for the Wrangler command. The health check works with inference disabled. Use the integration suite to exercise protected chat with synthetic bindings.
 
-The Worker uses Fetch streams and request cancellation signals. Cloudflare handles connection framing, including `100 Continue` and malformed wire-level requests. Node.js still handles those at its HTTP boundary and continues serving V1 for local clients. The Wrangler config disables both `workers_dev` and preview URLs. The public portfolio stays on GitHub Pages with chat disabled while Turnstile, quotas, and concurrency controls are pending.
+The Worker uses Fetch streams and request cancellation signals. Cloudflare handles connection framing, including `100 Continue` and malformed wire-level requests. Node.js still handles those at its HTTP boundary and continues serving V1 for local clients. The Wrangler config disables both `workers_dev` and preview URLs. The public portfolio stays on GitHub Pages with chat disabled.
+
+The Worker requires a fresh `X-Digital-Twin-Challenge` header on each V2 POST. The JSON contract and continuation tokens are unchanged. After checking origin, trusted Cloudflare IP metadata, and the approximate edge rate limit, the Worker verifies the token with Siteverify. A SQLite Durable Object claims its digest for six minutes. The shared chat service verifies signed context and can refuse locally before requesting an inference lease.
+
+| Setting | Checked-in default |
+| --- | --- |
+| `DIGITAL_TWIN_INFERENCE_ENABLED` | `false` |
+| `CHAT_RATE_LIMITER` | 8 protected POSTs per minute per trusted IP, approximate per edge location |
+| `DIGITAL_TWIN_DAILY_LIMIT` | 30 admissions per UTC day |
+| `DIGITAL_TWIN_MINUTE_LIMIT` | 10 admissions in a rolling minute |
+| `DIGITAL_TWIN_MAX_CONCURRENT` | 2 live leases |
+| `TURNSTILE_EXPECTED_HOSTNAME` and `TURNSTILE_EXPECTED_ACTION` | `jcquevedo84.github.io` and `digital_twin_chat` |
+| `OPENROUTER_TIMEOUT_MS` | 25 seconds through complete response consumption |
+
+Change the edge limit in the Wrangler binding. Set the remaining limits through Worker variables. The edge identity is a throttling signal. The SQLite object enforces global limits in one transaction and preserves spent attempts after errors or disconnections. Grants expire if dispatch misses the five-second window. The lease covers the provider deadline plus a five-second cleanup margin. Completed calls release the exact lease. Uncertain calls retain it until expiry. The object uses indexed timestamps, bounded cleanup, and a coalesced alarm. Its schema v1 is initialized transactionally, and Wrangler declares the SQLite class through `exports`.
 
 ## Validation and static preview
 
@@ -169,4 +183,8 @@ Configure `OPENROUTER_API_KEY` as a secret in the independently deployed backend
 
 Provision `DIGITAL_TWIN_CONVERSATION_SIGNING_KEY` in the backend's managed secret store. Use a dedicated random key per environment and share that environment's key across its backend replicas. Keep the key out of frontend build variables, source control, and logs. Provision the V2-capable backend before publishing the updated static frontend. Rotation makes outstanding tokens fail verification, and visitors can Retry without earlier context. If the frontend needs to roll back, keep the hardened V1 backend behavior so older clients continue using latest-question-only inference.
 
-Public Worker deployment requires the admission controls and provider privacy review in B01 Phase 2.
+For a separately approved staging deployment, use a distinct rate-limit namespace and Durable Object namespace. Register the exact expected Turnstile hostname and action. Provision `TURNSTILE_SECRET_KEY`, a replacement `OPENROUTER_API_KEY`, and an independent random `DIGITAL_TWIN_CONVERSATION_SIGNING_KEY` as encrypted secrets. Confirm that real edge ingress supplies the expected metadata and that worst-case inputs fit the chosen Workers CPU and quota limits.
+
+The Worker requires a configured free model and a reviewed `OPENROUTER_ALLOWED_PROVIDERS` allowlist. Its requests require ZDR, deny data collection, cap prompt, completion, and per-request prices at zero, and disable provider fallback. Verify the exact provider/model route and account logging controls separately before activating it. Keep inference off if no eligible endpoint is available. The Worker emits bounded outcome and timing fields. Cloud observability is disabled in the checked-in configuration.
+
+For rollback after an approved staging or production deployment, disable inference first and verify that chat returns a sanitized 503 while health remains available. Preserve the admission namespace and state. In-flight provider exchanges can continue through the existing deadlines as the new version propagates. Roll back only to a compatible protected version, or roll forward with inference kept off if the class or schema changed.

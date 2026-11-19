@@ -12,7 +12,7 @@ const forbiddenText = [
   "Notifications of Change",
   "SEC codes",
 ];
-const serverOnlyNames = ["OPENROUTER_API_KEY", "DIGITAL_TWIN_CONVERSATION_SIGNING_KEY"];
+const serverOnlyNames = ["OPENROUTER_API_KEY", "DIGITAL_TWIN_CONVERSATION_SIGNING_KEY", "TURNSTILE_SECRET_KEY"];
 const credentialValues = serverOnlyNames
   .map((name) => process.env[name]?.trim())
   .filter(Boolean)
@@ -40,7 +40,7 @@ async function collectFiles(directory, prefix = "") {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
     const name = `${prefix}${entry.name}`;
-    if (/(?:^|\/)(?:\.env(?:\.|$)|(?:resource|server|backend|node_modules)(?:\/|$))/i.test(name)) {
+    if (/(?:^|\/)(?:(?:\.env|\.dev\.vars)(?:\.|$)|(?:resource|server|backend|worker|node_modules|\.wrangler)(?:\/|$))/i.test(name)) {
       entries.push({ name, privatePath: true });
     } else if (entry.isDirectory()) {
       entries.push(...await collectFiles(path, `${name}/`));
