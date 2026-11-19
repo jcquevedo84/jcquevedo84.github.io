@@ -5,7 +5,8 @@ import { validateMessages } from "./validation.mjs";
 
 export function createChatService({ providerClient }) {
   return {
-    async answer(rawMessages) {
+    async answer(rawMessages, { signal } = {}) {
+      signal?.throwIfAborted();
       const messages = validateMessages(rawMessages);
       const latestQuestion = messages.at(-1).content;
 
@@ -15,7 +16,7 @@ export function createChatService({ providerClient }) {
 
       const knowledge = selectKnowledge(messages);
       const systemPrompt = buildSystemPrompt(knowledge);
-      const content = await providerClient.complete(systemPrompt, messages);
+      const content = await providerClient.complete(systemPrompt, messages, { signal });
       return { role: "assistant", content };
     },
   };

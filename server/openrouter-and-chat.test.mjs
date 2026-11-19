@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { createChatService } from "./chat-service.mjs";
 import {
@@ -366,6 +368,132 @@ test("OpenRouter client distinguishes AbortController timeout from other transpo
       && error.upstreamStatus === null
       && error.transport.timedOut === true,
   );
+});
+
+test("OpenRouter accepts exactly 256 KiB of decoded bytes and releases the reader", async () => {
+  const payload = JSON.stringify({ choices: [{ message: { content: "Respuesta válida." } }] });
+  const bytes = Buffer.concat([Buffer.from(payload), Buffer.alloc(256 * 1024 - Buffer.byteLength(payload), " ")]);
+  const split = bytes.indexOf(Buffer.from("á")) + 1;
+  let cancellations = 0;
+  const response = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes.subarray(0, split));
+      controller.enqueue(bytes.subarray(split));
+      controller.close();
+    },
+    cancel() { cancellations += 1; },
+  }), { headers: { "Content-Length": String(bytes.byteLength) } });
+  const client = createOpenRouterClient({ ...baseConfiguration, fetchImpl: async () => response });
+
+  const answer = await client.complete("System", [{ role: "user", content: "Question" }]);
+  assert.equal(answer, "Respuesta válida.");
+  assert.equal(response.body.locked, false);
+  assert.equal(cancellations, 0);
+});
+
+test("OpenRouter cancels oversized bodies with or without a length header and observes cleanup failures", async () => {
+  for (const headers of [{}, { "Content-Length": String(256 * 1024 + 1) }]) {
+    let cancellations = 0;
+    const response = new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(256 * 1024));
+        controller.enqueue(new Uint8Array(1));
+      },
+      cancel() {
+        cancellations += 1;
+        throw new Error("synthetic stream cleanup failure");
+      },
+    }), { headers });
+    const client = createOpenRouterClient({ ...baseConfiguration, fetchImpl: async () => response });
+
+    await assert.rejects(
+      client.complete("System", [{ role: "user", content: "Question" }]),
+      { code: "response_too_large", origin: "upstream_body", upstreamStatus: 200 },
+    );
+    assert.equal(cancellations, 1);
+    assert.equal(response.body.locked, false);
+  }
+});
+
+test("a stalled mocked response body times out, cancels its reader, and logs only classified failure data", async () => {
+  const records = [];
+  let cancellations = 0;
+  const response = new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new TextEncoder().encode("synthetic incomplete provider body")); },
+    cancel() { cancellations += 1; },
+  }));
+  const client = createOpenRouterClient({
+    ...baseConfiguration,
+    debug: true,
+    logger: { log: (line) => records.push(JSON.parse(line)) },
+    timeoutMs: 30,
+    fetchImpl: async () => response,
+  });
+
+  await assert.rejects(
+    client.complete("synthetic system text", [{ role: "user", content: "synthetic visitor message" }]),
+    { code: "timeout", origin: "transport_after_headers", upstreamStatus: 200 },
+  );
+  assert.equal(records.at(-1).event, "openrouter.transport_error");
+  assert.equal(records.at(-1).timedOut, true);
+  assert.doesNotMatch(JSON.stringify(records), /synthetic (?:incomplete provider body|system text|visitor message)|test-key-never-log/);
+  assert.equal(cancellations, 1);
+  assert.equal(response.body.locked, false);
+});
+
+test("caller cancellation wins over a late provider body and clears signal forwarding", async () => {
+  const caller = new AbortController();
+  const reason = new Error("synthetic client disconnect");
+  let notifyRead;
+  let bodyController;
+  let upstreamSignal;
+  let cancellations = 0;
+  const reading = new Promise((resolve) => { notifyRead = resolve; });
+  const response = new Response(new ReadableStream({
+    start(controller) { bodyController = controller; },
+    pull() { notifyRead(); },
+    cancel() { cancellations += 1; },
+  }, { highWaterMark: 0 }));
+  const client = createOpenRouterClient({
+    ...baseConfiguration,
+    fetchImpl: async (_url, options) => {
+      upstreamSignal = options.signal;
+      return response;
+    },
+  });
+
+  const pending = assert.rejects(
+    client.complete("System", [{ role: "user", content: "Question" }], { signal: caller.signal }),
+    (error) => error === reason,
+  );
+  await reading;
+  bodyController.enqueue(new TextEncoder().encode(JSON.stringify({ choices: [{ message: { content: "Late answer" } }] })));
+  caller.abort(reason);
+  await pending;
+  assert.equal(upstreamSignal.reason, reason);
+  assert.equal(cancellations, 1);
+  assert.equal(response.body.locked, false);
+  assert.equal(getEventListeners(caller.signal, "abort").length, 0);
+  assert.equal(getEventListeners(upstreamSignal, "abort").length, 0);
+});
+
+test("completed inference detaches cancellation and clears its deadline", async () => {
+  const caller = new AbortController();
+  let upstreamSignal;
+  const client = createOpenRouterClient({
+    ...baseConfiguration,
+    timeoutMs: 30,
+    fetchImpl: async (_url, options) => {
+      upstreamSignal = options.signal;
+      return new Response(JSON.stringify({ choices: [{ message: { content: "Done" } }] }));
+    },
+  });
+
+  assert.equal(await client.complete("System", [{ role: "user", content: "Question" }], { signal: caller.signal }), "Done");
+  assert.equal(getEventListeners(caller.signal, "abort").length, 0);
+  caller.abort();
+  await delay(60);
+  assert.equal(upstreamSignal.aborted, false);
 });
 
 test("OpenRouter client identifies invalid JSON received from an upstream HTTP response", async () => {

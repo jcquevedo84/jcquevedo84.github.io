@@ -1,5 +1,9 @@
 import { createOpenRouterDiagnostics } from "./openrouter-diagnostics.mjs";
 
+const MAX_RESPONSE_BYTES = 256 * 1024;
+
+class ProviderBodyTooLargeError extends Error {}
+
 export class OpenRouterError extends Error {
   constructor(code, {
     upstreamStatus = null,
@@ -145,6 +149,47 @@ function retryAfterSeconds(response) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+async function readResponseBody(response, signal) {
+  if (!response.body) {
+    signal.throwIfAborted();
+    return { text: "", bytes: 0 };
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let bytes = 0;
+  let complete = false;
+  let cancelled = false;
+
+  function cancel() {
+    if (cancelled) return;
+    cancelled = true;
+    // Cancellation settles pending reads. Observe cleanup errors without waiting on the producer.
+    void reader.cancel().catch(() => {});
+  }
+
+  signal.addEventListener("abort", cancel, { once: true });
+  try {
+    signal.throwIfAborted();
+    while (true) {
+      const { done, value } = await reader.read();
+      signal.throwIfAborted();
+      if (done) {
+        complete = true;
+        break;
+      }
+      bytes += value.byteLength;
+      if (bytes > MAX_RESPONSE_BYTES) throw new ProviderBodyTooLargeError();
+      if (value.byteLength > 0) chunks.push(value);
+    }
+    return { text: new TextDecoder().decode(Buffer.concat(chunks, bytes)), bytes };
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    if (!complete) cancel();
+    reader.releaseLock();
+  }
+}
+
 export function createOpenRouterClient({
   apiKey,
   apiUrl,
@@ -168,7 +213,8 @@ export function createOpenRouterClient({
 
   return {
     model,
-    async complete(systemPrompt, messages) {
+    async complete(systemPrompt, messages, { signal } = {}) {
+      signal?.throwIfAborted();
       const missingVariables = [];
       if (!apiKey) missingVariables.push("OPENROUTER_API_KEY");
       if (!model) missingVariables.push("OPENROUTER_MODEL");
@@ -195,63 +241,60 @@ export function createOpenRouterClient({
       diagnostics.request({ correlationId, url: requestUrl, headers, body, bodyText, timeoutMs });
 
       const controller = new AbortController();
-      let timedOut = false;
-      const timeout = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-      }, timeoutMs);
+      const deadline = new Error("The provider request deadline expired.");
+      const abort = () => controller.abort(signal.reason);
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+      const timeout = setTimeout(() => controller.abort(deadline), timeoutMs);
 
       let response;
+      let responseBody;
       try {
+        controller.signal.throwIfAborted();
         response = await fetchImpl(apiUrl, {
           method: "POST",
           headers,
           body: bodyText,
           signal: controller.signal,
         });
+        responseBody = await readResponseBody(response, controller.signal);
       } catch (error) {
+        const timedOut = controller.signal.reason === deadline;
+        if (controller.signal.aborted && !timedOut) throw controller.signal.reason;
+        if (error instanceof ProviderBodyTooLargeError) {
+          throw new OpenRouterError("response_too_large", {
+            upstreamStatus: response.status,
+            origin: "upstream_body",
+            correlationId,
+          });
+        }
+
         const transport = diagnostics.transport({
           correlationId,
-          error,
+          error: timedOut ? deadline : error,
           durationMs: Math.max(0, now() - startedAt),
           timedOut,
+          response,
         });
-        const requestConstructionFailed = transport.category === "request_construction";
+        const requestConstructionFailed = !response && transport.category === "request_construction";
         throw new OpenRouterError(
           timedOut ? "timeout" : (requestConstructionFailed ? "request_construction_error" : "network_error"),
           {
-            upstreamStatus: null,
-            origin: requestConstructionFailed ? "local_request" : "transport",
+            upstreamStatus: response?.status ?? null,
+            origin: response ? "transport_after_headers" : (requestConstructionFailed ? "local_request" : "transport"),
             correlationId,
             transport,
           },
         );
       } finally {
         clearTimeout(timeout);
+        signal?.removeEventListener("abort", abort);
       }
 
-      let responseText;
-      try {
-        responseText = await response.text();
-      } catch (error) {
-        const transport = diagnostics.transport({
-          correlationId,
-          error,
-          durationMs: Math.max(0, now() - startedAt),
-          timedOut: false,
-          response,
-        });
-        throw new OpenRouterError("network_error", {
-          upstreamStatus: response.status,
-          origin: "transport_after_headers",
-          correlationId,
-          transport,
-        });
-      }
       let payload = null;
       let parsingSucceeded = false;
       try {
-        payload = JSON.parse(responseText);
+        payload = JSON.parse(responseBody.text);
         parsingSucceeded = true;
       } catch {
         payload = null;
@@ -276,7 +319,7 @@ export function createOpenRouterClient({
         payload,
         parsingSucceeded,
         validCompletion,
-        bodyBytes: Buffer.byteLength(responseText),
+        bodyBytes: responseBody.bytes,
         parsedErrorCode: parsingSucceeded ? providerErrorCode(payload) : null,
         parsedErrorType: parsingSucceeded ? providerErrorType(payload) : null,
         completion,
