@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - feature/professional-portfolio
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+
+      - name: Check toolchain and tracked private paths
+        run: |
+          node --version
+          npm --version
+          test "$(node --version)" = "v$(node -p 'require("./package.json").engines.node')"
+          test "$(npm --version)" = "$(node -p 'require("./package.json").engines.npm')"
+          node --input-type=module <<'NODE'
+          import { execFileSync } from "node:child_process";
+
+          const files = execFileSync("git", ["ls-files", "-z"], { encoding: "utf8" }).split("\0");
+          const privatePath = /(?:^|\/)(?:\.env(?:[./]|$)|resource(?:\/|$))/i;
+          if (files.some((file) => file !== ".env.example" && privatePath.test(file))) {
+            console.error("Tracked environment or private resource files are forbidden.");
+            process.exitCode = 1;
+          }
+          NODE
+
+      - name: Install locked dependencies
+        run: |
+          npm ci --no-audit --no-fund
+          git diff --exit-code -- package.json package-lock.json
+
+      - name: Verify production export
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+          NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL: https://api.example.invalid
+          OPENROUTER_API_KEY: b02-synthetic-provider-privacy-marker
+          DIGITAL_TWIN_CONVERSATION_SIGNING_KEY: b02-synthetic-signing-privacy-marker
+        run: npm run verify

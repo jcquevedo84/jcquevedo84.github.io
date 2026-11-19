@@ -1,4 +1,4 @@
-import { readFile, readdir, stat } from "node:fs/promises";
+import { lstat, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 const outputDirectory = "out";
@@ -6,69 +6,114 @@ const forbiddenText = [
   "Profile.pdf",
   "Contenido_para_mi_sitio_profesional",
   "Trayectoria_profesional_antes_de_e4GS_Lab",
-  "OPENROUTER_API_KEY",
-  "sk-or-",
   "BORRADOR EDITORIAL PRIVADO",
   "Fuentes privadas de revisión",
   "Notifications of Change",
   "SEC codes",
 ];
-const forbiddenExtensions = [".docx", ".pdf"];
+const serverOnlyNames = ["OPENROUTER_API_KEY", "DIGITAL_TWIN_CONVERSATION_SIGNING_KEY"];
+const credentialValues = serverOnlyNames
+  .map((name) => process.env[name]?.trim())
+  .filter(Boolean)
+  .map((value) => Buffer.from(value));
 const requiredPublicContact = ["jcquevedo84@gmail.com", "+54 9 11 3275 2039"];
+const requiredPublicAssets = ["index.html", "icon.svg", "jcquevedo84-linkedin.jpg"];
+const privateDocument = /\.(?:docx?|pdf)$/i;
 
-async function collectFiles(directory) {
-  const files = [];
-  for (const name of await readdir(directory)) {
-    const path = join(directory, name);
-    const metadata = await stat(path);
-    if (metadata.isDirectory()) files.push(...await collectFiles(path));
-    else files.push(path);
+async function collectFiles(directory, prefix = "") {
+  const entries = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    const name = `${prefix}${entry.name}`;
+    if (/(?:^|\/)(?:\.env(?:\.|$)|resource(?:\/|$))/i.test(name)) {
+      entries.push({ name, privatePath: true });
+    } else if (entry.isDirectory()) {
+      entries.push(...await collectFiles(path, `${name}/`));
+    } else {
+      entries.push({ path, name, regular: entry.isFile() });
+    }
   }
-  return files;
+  return entries;
 }
 
-async function configuredOpenRouterKey() {
-  try {
-    const environmentFile = await readFile(".env", "utf8");
-    const assignment = environmentFile
-      .split(/\r?\n/)
-      .find((line) => /^\s*OPENROUTER_API_KEY\s*=/.test(line));
-    if (!assignment) return "";
-    return assignment
-      .slice(assignment.indexOf("=") + 1)
-      .trim()
-      .replace(/^['"]|['"]$/g, "");
-  } catch {
-    return "";
+async function verifyExport() {
+  if (!(await lstat(outputDirectory)).isDirectory()) throw new Error("Invalid output directory");
+
+  const entries = await collectFiles(outputDirectory);
+  const publicContactFound = new Set();
+  const publicFiles = new Set();
+  const results = {
+    static_files_checked: 0,
+    private_document_files: 0,
+    private_paths: 0,
+    unsafe_entries: 0,
+    forbidden_content_matches: 0,
+    server_only_name_matches: 0,
+    credential_pattern_matches: 0,
+    credential_value_matches: 0,
+    missing_required_assets: 0,
+    missing_next_asset_references: 0,
+    missing_digital_twin_endpoint: 0,
+    missing_public_contact: 0,
+  };
+  let indexHtml = "";
+  let digitalTwinBundled = false;
+
+  for (const { path, name, privatePath, regular } of entries) {
+    if (privatePath) {
+      results.private_paths += 1;
+      continue;
+    }
+    if (privateDocument.test(name)) {
+      results.private_document_files += 1;
+      continue;
+    }
+    if (!regular) {
+      results.unsafe_entries += 1;
+      continue;
+    }
+
+    const content = await readFile(path);
+    const text = content.toString("utf8");
+    const searchable = `${name}\n${text}`;
+    results.static_files_checked += 1;
+    if (content.length > 0) publicFiles.add(name);
+    if (name === "index.html") indexHtml = text;
+    if (name.startsWith("_next/static/") && name.endsWith(".js") && text.includes("/v2/chat")) {
+      digitalTwinBundled = true;
+    }
+    if (forbiddenText.some((value) => searchable.includes(value))) results.forbidden_content_matches += 1;
+    if (serverOnlyNames.some((value) => searchable.includes(value))) results.server_only_name_matches += 1;
+    if (searchable.includes("sk-or-")) results.credential_pattern_matches += 1;
+    if (credentialValues.some((value) => content.includes(value) || Buffer.from(name).includes(value))) {
+      results.credential_value_matches += 1;
+    }
+    for (const value of requiredPublicContact) {
+      if (text.includes(value)) publicContactFound.add(value);
+    }
   }
+
+  const assets = new Set(Array.from(
+    indexHtml.matchAll(/(?:src|href)="\/(_next\/static\/[^"?#]+)(?:[?#][^"]*)?"/g),
+    ([, path]) => path,
+  ));
+  results.missing_required_assets = requiredPublicAssets.filter((name) => !publicFiles.has(name)).length;
+  results.missing_next_asset_references = assets.size === 0 ? 1 : [...assets].filter((name) => !publicFiles.has(name)).length;
+  results.missing_digital_twin_endpoint = Number(!digitalTwinBundled);
+  results.missing_public_contact = requiredPublicContact.length - publicContactFound.size;
+
+  const passed = results.static_files_checked > 0
+    && Object.entries(results).every(([name, count]) => name === "static_files_checked" || count === 0);
+  for (const [name, count] of Object.entries(results)) console.log(`${name}=${count}`);
+  console.log(`credential_values_provided=${credentialValues.length}`);
+  console.log(`static_privacy_check=${passed ? "PASS" : "FAIL"}`);
+  if (!passed) process.exitCode = 1;
 }
 
-const files = await collectFiles(outputDirectory);
-const disallowedFiles = files.filter((file) => forbiddenExtensions.some((extension) => file.endsWith(extension)));
-let forbiddenMatches = 0;
-let credentialMatches = 0;
-const publicContactMatches = new Set();
-const apiKey = await configuredOpenRouterKey();
-
-for (const file of files) {
-  const content = await readFile(file);
-  const text = content.toString("utf8");
-  if (forbiddenText.some((value) => text.includes(value))) forbiddenMatches += 1;
-  if (apiKey && content.includes(Buffer.from(apiKey))) credentialMatches += 1;
-  for (const value of requiredPublicContact) {
-    if (text.includes(value)) publicContactMatches.add(value);
-  }
+try {
+  await verifyExport();
+} catch {
+  console.error("Static privacy verification could not read a valid out/ directory. Run the production build first.");
+  console.log("static_privacy_check=FAIL");
+  process.exitCode = 1;
 }
-
-const missingPublicContact = requiredPublicContact.length - publicContactMatches.size;
-const failures = disallowedFiles.length + forbiddenMatches + credentialMatches + missingPublicContact;
-console.log(`static_files_checked=${files.length}`);
-console.log(`private_document_files=${disallowedFiles.length}`);
-console.log(`forbidden_content_matches=${forbiddenMatches}`);
-console.log(`credential_configured=${Boolean(apiKey)}`);
-console.log(`credential_matches=${credentialMatches}`);
-console.log(`required_public_contact_matches=${publicContactMatches.size}`);
-console.log(`missing_public_contact=${missingPublicContact}`);
-console.log(`static_privacy_check=${failures === 0 ? "PASS" : "FAIL"}`);
-
-if (failures > 0) process.exitCode = 1;

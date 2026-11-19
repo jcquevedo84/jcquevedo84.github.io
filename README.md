@@ -4,6 +4,18 @@ Static Next.js portfolio with an independent AI-powered professional Digital Twi
 
 ## Local development
 
+Use the project toolchain before installing dependencies. With NVM, run from the repository root:
+
+```bash
+nvm install
+nvm use
+node --version  # v24.22.3
+npm --version   # 11.19.1
+npm ci
+```
+
+`.nvmrc` selects the Node version for the current shell with `nvm use`. Node 24.22.3 includes npm 11.19.1. Use `npm ci` for clean installs from the committed lockfile.
+
 The existing `.env` file is read by the backend and must not be committed or uploaded. Use `.env.example` only as a variable reference. Both `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` are required; the backend will not silently substitute a model.
 
 ```bash
@@ -36,13 +48,13 @@ The combined command checks ports 3000 and 8787 first and stops without killing 
 ## Validation and static preview
 
 ```bash
-npm run lint
-npm run typecheck
-npm run test:api
-npm run diagnose:openrouter
-npm run build
+npm run verify
 npm run preview
 ```
+
+For release-equivalent validation, run `npm ci` and `npm run verify` in a clean checkout with the pinned toolchain. The gate runs ESLint, generates Next.js route types, checks TypeScript, runs mock-only tests, builds the static site, and verifies the fresh `out/` directory. Builds also run Next.js's own TypeScript check.
+
+Static verification checks public assets, the V2 client bundle, private paths and document markers, backend-only variable names, and credential values explicitly supplied in the process environment. It never reads `.env` and reports counts only. CI uses synthetic credential values and an inert public API URL. The separate OpenRouter diagnostic is a live check outside the gate.
 
 `npm run diagnose:openrouter` makes one minimal Chat Completions request using the exact configured model, a redacted prompt, and a 16-token output limit. It recognizes `openrouter/free` and model identifiers ending in `:free` as zero-cost; every other identifier is refused unless the separate, explicit `--allow-paid` flag is supplied. The command never prints credentials, prompts, professional knowledge, or completion content.
 
@@ -89,6 +101,8 @@ The approved navy collared-shirt portrait is integrated into the About section f
 These controls reduce risk but do not guarantee prompt-injection prevention. Before public deployment, use trusted proxy configuration, durable/distributed rate limiting, managed secret storage, abuse monitoring, appropriate provider budget limits, operational alerting, and a reviewed privacy notice. CORS limits browser origins but is not authentication.
 
 ## Future deployment configuration
+
+The CI workflow validates the build. For a future Pages release, publish only the verified contents of `out/` and keep the independent Digital Twin backend deployed separately. The current paths assume the site is hosted at the domain root. If branch publishing is selected, preserve `_next/` by adding `.nojekyll` to the publish root.
 
 For `jcquevedo84.github.io`, build the frontend with an HTTPS API URL:
 
