@@ -1,0 +1,27 @@
+{
+  "name": "digital-twin-staging",
+  "main": "worker/staging-fixture.mjs",
+  "compatibility_date": "2026-11-17",
+  "compatibility_flags": ["no_nodejs_compat", "no_nodejs_compat_v2"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "send_metrics": false,
+  "observability": { "enabled": false },
+  "vars": {
+    "STAGING_MODE": "off",
+    "DIGITAL_TWIN_INFERENCE_ENABLED": "false",
+    "TURNSTILE_EXPECTED_ACTION": "digital_twin_chat",
+    "DIGITAL_TWIN_DAILY_LIMIT": "12",
+    "DIGITAL_TWIN_MINUTE_LIMIT": "3",
+    "DIGITAL_TWIN_MAX_CONCURRENT": "2"
+  },
+  "ratelimits": [
+    { "name": "CHAT_RATE_LIMITER", "namespace_id": "1002", "simple": { "limit": 8, "period": 60 } }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "ADMISSION", "class_name": "InferenceAdmission" }]
+  },
+  "exports": {
+    "InferenceAdmission": { "type": "durable-object", "storage": "sqlite" }
+  }
+}

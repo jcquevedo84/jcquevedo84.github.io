@@ -10,9 +10,13 @@ const { Miniflare } = miniflare;
 const root = fileURLToPath(new URL("../", import.meta.url));
 export const runtimeConfig = JSON.parse(await readFile(join(root, "wrangler.jsonc"), "utf8"));
 export const stagingConfig = JSON.parse(await readFile(join(root, "wrangler.staging.jsonc"), "utf8"));
+export const stagingFixtureConfig = JSON.parse(await readFile(join(root, "wrangler.staging-fixture.jsonc"), "utf8"));
 const modulePaths = [
   runtimeConfig.main,
   stagingConfig.main,
+  stagingFixtureConfig.main,
+  "worker/staging-shared.mjs",
+  "worker/protected-chat.mjs",
   "worker/admission.mjs",
   "worker/config.mjs",
   "worker/turnstile.mjs",
@@ -99,6 +103,8 @@ export async function startWorker(t, {
   accessAudience,
   omit = [],
   controlledClock = false,
+  inspectAdmission = controlledClock,
+  abortRequestAfterMs,
   persistencePath,
   rateLimit = config.ratelimits[0].simple.limit,
   mock = (response) => jsonResponse(response, completion("Synthetic reply.")),
@@ -113,10 +119,12 @@ export async function startWorker(t, {
     ...config.vars,
     ...(config === runtimeConfig && { DIGITAL_TWIN_INFERENCE_ENABLED: "true" }),
     DIGITAL_TWIN_CONVERSATION_SIGNING_KEY: signingKey,
-    OPENROUTER_API_KEY: providerKey,
-    OPENROUTER_MODEL: providerModel,
-    OPENROUTER_ALLOWED_PROVIDERS: providerName,
-    OPENROUTER_TIMEOUT_MS: "3000",
+    ...(config !== stagingFixtureConfig && {
+      OPENROUTER_API_KEY: providerKey,
+      OPENROUTER_MODEL: providerModel,
+      OPENROUTER_ALLOWED_PROVIDERS: providerName,
+      OPENROUTER_TIMEOUT_MS: "3000",
+    }),
     TURNSTILE_SECRET_KEY: turnstileKey,
     ...bindings,
   };
@@ -160,12 +168,27 @@ export async function startWorker(t, {
     }
   }
 
-  const mainModule = controlledClock ? "fixture-entry.mjs" : config.main;
+  const entryFixture = controlledClock ? clockFixture : abortRequestAfterMs === undefined ? null : `
+    import target from ${JSON.stringify(`./${config.main}`)};
+    export { InferenceAdmission } from "./worker/admission.mjs";
+    export default {
+      async fetch(request, env, ctx) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), ${JSON.stringify(abortRequestAfterMs)});
+        try {
+          return await target.fetch(new Request(request, { signal: controller.signal, cf: request.cf }), env, ctx);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+    };
+  `;
+  const mainModule = entryFixture ? "fixture-entry.mjs" : config.main;
   const workerd = new Miniflare({
     host: "127.0.0.1",
     port: 0,
     cf: false,
-    unsafeInspectDurableObjects: controlledClock,
+    unsafeInspectDurableObjects: inspectAdmission,
     resourcePersistencePath: persistencePath,
     enableDevRegistry: false,
     telemetry: { enabled: false },
@@ -179,7 +202,7 @@ export async function startWorker(t, {
         manifest: {
           mainModule,
           modulesRoot: root,
-          modules: controlledClock ? { ...modules, [mainModule]: { type: "esm", contents: clockFixture } } : modules,
+          modules: entryFixture ? { ...modules, [mainModule]: { type: "esm", contents: entryFixture } } : modules,
         },
         exports: config.exports,
         env,
