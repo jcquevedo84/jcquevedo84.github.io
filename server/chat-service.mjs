@@ -11,7 +11,12 @@ export class MissingConversationConfigurationError extends Error {
   }
 }
 
-export function createChatService({ providerClient, continuation = null, selectTopics = selectKnowledge }) {
+export function createChatService({
+  providerClient,
+  continuation = null,
+  selectTopics = selectKnowledge,
+  buildPrompt = (messages) => buildSystemPrompt(selectTopics(messages)),
+}) {
   async function complete(question, exchanges, signal, remember = false) {
     const { retained, refuse } = reviewConversation(question, exchanges);
     if (refuse) {
@@ -24,7 +29,7 @@ export function createChatService({ providerClient, continuation = null, selectT
     ]);
     messages.push({ role: "user", content: question });
 
-    const systemPrompt = buildSystemPrompt(selectTopics(messages));
+    const systemPrompt = buildPrompt(messages);
     const content = await providerClient.complete(systemPrompt, messages, { signal });
     signal?.throwIfAborted();
     const message = { role: "assistant", content };

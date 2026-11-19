@@ -84,6 +84,31 @@ The Worker requires a fresh `X-Digital-Twin-Challenge` header on each V2 POST. T
 
 Change the edge limit in the Wrangler binding. Set the remaining limits through Worker variables. The edge identity is a throttling signal. The SQLite object enforces global limits in one transaction and preserves spent attempts after errors or disconnections. Grants expire if dispatch misses the five-second window. The lease covers the provider deadline plus a five-second cleanup margin. Completed calls release the exact lease. Uncertain calls retain it until expiry. The object uses indexed timestamps, bounded cleanup, and a coalesced alarm. Its schema v1 is initialized transactionally, and Wrangler declares the SQLite class through `exports`.
 
+### Protected staging (local Gate A)
+
+`wrangler.staging.jsonc` defines a separate `digital-twin-staging` Worker and SQLite Durable Object namespace. It has no route and disables both `workers.dev` and preview URLs. The staging Worker accepts only the exact HTTPS `digital-twin-staging.<subdomain>.workers.dev` origin configured by `STAGING_HOST` and a native `ctx.access.aud` matching `STAGING_ACCESS_AUD`. This applies to health, preflight, chat, and the harness. An Access assertion header or cookie supplied to the Worker cannot meet this check.
+
+| Mode | Behavior |
+| --- | --- |
+| `off` (default) | Authenticated health is available once hostname and audience are configured. Chat returns `503 inference_disabled`, even if the inference switch is accidentally set to true. The harness is unavailable. |
+| `fixture` | Requires the inference switch, staging Turnstile credentials, and a staging `DIGITAL_TWIN_CONVERSATION_SIGNING_KEY`. V2 uses a local synthetic completion transport with no provider credential or network operation. Turnstile, rate limiting, challenge claims, signed history, and global admission still apply. The checked-in limits are 8 per minute per edge bucket, 12 attempts per UTC day, 3 per rolling minute, and 2 concurrent leases. |
+| `smoke` | Reserved for separately authorized live testing. Requires a dedicated `STAGING_SMOKE_SIGNING_KEY`, an independent restricted OpenRouter credential, an exact `:free` model, one approved provider slug, and a UTC expiration (`new Date(...).toISOString()`) at most 10 minutes ahead and in the same UTC day. Requires limits of 2/day, 2/rolling minute, 1 concurrent lease, and 128 completion tokens. The deadline is rechecked before dispatch. Applies the shared zero-price cap, ZDR requirement, data-collection denial, and disabled fallback. An in-flight call can finish within the normal provider deadline. |
+
+The active-mode `/__staging` harness uses a public `STAGING_TURNSTILE_SITE_KEY`, the `digital_twin_chat` action, and same-origin `POST /v2/chat`. It offers fixed synthetic questions and keeps signed continuation tokens in memory. The smoke request uses a synthetic profile, and the two modes use separate signing keys. The two-attempt smoke cap applies to the staging SQLite namespace for that UTC day, including fixture attempts already admitted there. Verify the provider/model endpoint and account privacy settings separately before any live authorization.
+
+Validate locally in an isolated checkout containing no credential files. The tests supply synthetic bindings, simulate Cloudflare Access through Miniflare, and intercept all Worker egress in local `workerd`.
+
+```bash
+nvm use
+npm ci
+node --test worker/staging.test.mjs
+npm run verify
+CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV=false CLOUDFLARE_INCLUDE_PROCESS_ENV=false WRANGLER_SEND_METRICS=false \
+  npx --no-install wrangler deploy --config wrangler.staging.jsonc --name digital-twin-staging --dry-run
+```
+
+Gate B requires separate approval. Confirm the account, the exact Worker subdomain, availability of Worker-level Access for **All traffic**, and a dedicated edge rate-limit namespace before provisioning. Bootstrap an `off` version with both URL settings disabled and no routes or secrets. Record that version for rollback and protect the Worker with an allowlisted Access policy before separately enabling the canonical staging hostname. Verify unauthenticated requests and alternate URLs remain blocked. Leave inference `off` until the separately approved fixture gate. Keep preview URLs disabled. For recovery, return staging mode and the inference switch to `off` and `false`, or disable the staging route if needed. Preserve its SQLite namespace and leave the GitHub Pages build independent.
+
 ## Validation and static preview
 
 ```bash

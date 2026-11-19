@@ -9,8 +9,10 @@ import { SITEVERIFY_URL } from "./turnstile.mjs";
 const { Miniflare } = miniflare;
 const root = fileURLToPath(new URL("../", import.meta.url));
 export const runtimeConfig = JSON.parse(await readFile(join(root, "wrangler.jsonc"), "utf8"));
+export const stagingConfig = JSON.parse(await readFile(join(root, "wrangler.staging.jsonc"), "utf8"));
 const modulePaths = [
   runtimeConfig.main,
+  stagingConfig.main,
   "worker/admission.mjs",
   "worker/config.mjs",
   "worker/turnstile.mjs",
@@ -93,10 +95,12 @@ export function verification(fields = {}) {
 
 export async function startWorker(t, {
   bindings = {},
+  config = runtimeConfig,
+  accessAudience,
   omit = [],
   controlledClock = false,
   persistencePath,
-  rateLimit = runtimeConfig.ratelimits[0].simple.limit,
+  rateLimit = config.ratelimits[0].simple.limit,
   mock = (response) => jsonResponse(response, completion("Synthetic reply.")),
   mockVerification = (response) => jsonResponse(response, verification()),
 } = {}) {
@@ -106,8 +110,8 @@ export async function startWorker(t, {
   let rejectedOutboundRequests = 0;
   const signingKey = randomBytes(32).toString("hex");
   const variables = {
-    ...runtimeConfig.vars,
-    DIGITAL_TWIN_INFERENCE_ENABLED: "true",
+    ...config.vars,
+    ...(config === runtimeConfig && { DIGITAL_TWIN_INFERENCE_ENABLED: "true" }),
     DIGITAL_TWIN_CONVERSATION_SIGNING_KEY: signingKey,
     OPENROUTER_API_KEY: providerKey,
     OPENROUTER_MODEL: providerModel,
@@ -116,8 +120,8 @@ export async function startWorker(t, {
     TURNSTILE_SECRET_KEY: turnstileKey,
     ...bindings,
   };
-  const rateBinding = runtimeConfig.ratelimits[0];
-  const admissionBinding = runtimeConfig.durable_objects.bindings[0];
+  const rateBinding = config.ratelimits[0];
+  const admissionBinding = config.durable_objects.bindings[0];
   const env = {
     ...Object.fromEntries(Object.entries(variables).map(([name, value]) => [name, { type: "text", value }])),
     [rateBinding.name]: {
@@ -127,7 +131,7 @@ export async function startWorker(t, {
     },
     [admissionBinding.name]: {
       type: "durable-object",
-      worker: runtimeConfig.name,
+      worker: config.name,
       exportName: admissionBinding.class_name,
     },
   };
@@ -156,7 +160,7 @@ export async function startWorker(t, {
     }
   }
 
-  const mainModule = controlledClock ? "fixture-entry.mjs" : runtimeConfig.main;
+  const mainModule = controlledClock ? "fixture-entry.mjs" : config.main;
   const workerd = new Miniflare({
     host: "127.0.0.1",
     port: 0,
@@ -168,15 +172,16 @@ export async function startWorker(t, {
     handleStructuredLogs: (entry) => logs.push(entry),
     workers: [{
       config: {
-        name: runtimeConfig.name,
-        compatibilityDate: runtimeConfig.compatibility_date,
-        compatibilityFlags: runtimeConfig.compatibility_flags,
+        name: config.name,
+        compatibilityDate: config.compatibility_date,
+        compatibilityFlags: config.compatibility_flags,
+        ...(accessAudience && { access: { dev: { aud: accessAudience } } }),
         manifest: {
           mainModule,
           modulesRoot: root,
           modules: controlledClock ? { ...modules, [mainModule]: { type: "esm", contents: clockFixture } } : modules,
         },
-        exports: runtimeConfig.exports,
+        exports: config.exports,
         env,
       },
       dev: {

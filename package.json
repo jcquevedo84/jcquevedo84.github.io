@@ -18,7 +18,7 @@
     "lint": "node node_modules/eslint/bin/eslint.js .",
     "typecheck": "node node_modules/next/dist/bin/next typegen && node node_modules/typescript/bin/tsc --noEmit --incremental false",
     "test:api": "node scripts/test-api.mjs",
-    "test:worker": "node --test worker/admission.test.mjs worker/index.test.mjs",
+    "test:worker": "node --test worker/admission.test.mjs worker/index.test.mjs worker/staging.test.mjs",
     "diagnose:openrouter": "node --env-file-if-exists=.env scripts/diagnose-openrouter.mjs",
     "verify:static": "node scripts/verify-static-output.mjs",
     "verify": "npm run lint && npm run typecheck && npm run test:api && npm run test:worker && npm run build && npm run verify:static"

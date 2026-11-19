@@ -84,7 +84,7 @@ function recordOutcome(outcome, status, startedAt) {
   console.info(JSON.stringify({ event: "digital_twin.request", outcome, status, durationBucketMs }));
 }
 
-function protectedProvider(config, admission, digest, context) {
+function protectedProvider(config, admission, digest, context, fetchProvider) {
   return {
     async complete(systemPrompt, messages, { signal }) {
       const grant = await callBinding(() => admission.admit(digest), signal);
@@ -108,7 +108,7 @@ function protectedProvider(config, admission, digest, context) {
             throw protectionUnavailable();
           }
           dispatched = true;
-          return fetch(url, { ...options, redirect: "manual" });
+          return fetchProvider(url, { ...options, redirect: "manual" });
         },
       });
       try {
@@ -223,8 +223,8 @@ async function readJsonBody(request) {
   }
 }
 
-export default {
-  async fetch(request, environment, context) {
+export function createProtectedWorker({ fetchProvider = fetch, buildPrompt, providerTitle, validatePayload } = {}) {
+  async function handleRequest(request, environment, context) {
     let origin = null;
     const { signal } = request;
     const startedAt = Date.now();
@@ -282,6 +282,7 @@ export default {
         throw new ProtectionError(400, "challenge_required", "Complete a fresh challenge before sending a question.");
       }
       const payload = validateConversationRequest(await readJsonBody(request));
+      validatePayload?.(payload);
       const continuation = await createConversationContext(config.conversationSigningKey);
       if (!continuation) throw new MissingConversationConfigurationError();
 
@@ -293,8 +294,9 @@ export default {
       const claim = await callBinding(() => admission.claim(digest, verification.issuedAt), signal);
       if (claim?.outcome !== "claimed") rejectAdmission(claim);
 
-      const providerClient = protectedProvider(config.provider, admission, digest, context);
-      const chatService = createChatService({ providerClient, continuation });
+      const provider = providerTitle ? { ...config.provider, title: providerTitle } : config.provider;
+      const providerClient = protectedProvider(provider, admission, digest, context, fetchProvider);
+      const chatService = createChatService({ providerClient, continuation, buildPrompt });
       const answer = await chatService.answerWithContext(payload, { signal });
       signal.throwIfAborted();
       recordOutcome("answered", 200, startedAt);
@@ -326,5 +328,8 @@ export default {
       }
       return errorJson(500, "internal_error", "The Digital Twin encountered an unexpected error.", origin);
     }
-  },
-};
+  }
+  return { fetch: handleRequest };
+}
+
+export default createProtectedWorker();
