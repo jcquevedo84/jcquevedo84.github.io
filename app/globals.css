@@ -2032,7 +2032,7 @@ footer {
   display: grid;
   width: min(460px, calc(100vw - 40px));
   height: min(760px, calc(100dvh - 40px));
-  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto auto;
   overflow: hidden;
   color: #e2e8f0;
   border: 1px solid rgba(56, 189, 248, 0.34);
@@ -2342,12 +2342,23 @@ footer {
 .twin-disclosure {
   margin: 0;
   padding: 9px 15px 11px;
-  color: #64748b;
+  color: #a8b5c7;
   border-top: 1px solid rgba(148, 163, 184, 0.08);
   background: #071426;
-  font-size: 8px;
+  font-size: 11px;
   line-height: 1.45;
   text-align: center;
+}
+
+.twin-disclosure a,
+.twin-challenge p {
+  color: #c3d8ed;
+}
+
+.twin-challenge p {
+  margin: 0;
+  padding: 6px 14px;
+  font-size: 12px;
 }
 
 .reveal {

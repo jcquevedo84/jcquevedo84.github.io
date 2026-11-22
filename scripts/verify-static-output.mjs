@@ -3,6 +3,10 @@ import { join } from "node:path";
 
 const outputDirectory = "out";
 const digitalTwinEnabled = process.env.NEXT_PUBLIC_DIGITAL_TWIN_ENABLED !== "false";
+const publicDigitalTwin = process.env.NEXT_PUBLIC_DIGITAL_TWIN_ENABLED === "true";
+const productionApi = "https://digital-twin-production.jcquevedo84.workers.dev";
+const configuredApi = process.env.NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL;
+const siteKey = process.env.NEXT_PUBLIC_DIGITAL_TWIN_TURNSTILE_SITE_KEY ?? "";
 const forbiddenText = [
   "Profile.pdf",
   "Contenido_para_mi_sitio_profesional",
@@ -33,7 +37,7 @@ const requiredMarkup = [
   'name="description"',
 ];
 const privateDocument = /\.(?:docx?|pdf)$/i;
-const digitalTwinMarkers = /\/(?:v1|v2)\/chat\b|:8787\b|\btwin-(?:launcher|panel)\b/;
+const digitalTwinMarkers = /\/(?:v1|v2)\/chat\b|:8787\b|\btwin-(?:launcher|panel)\b|challenges\.cloudflare\.com\/turnstile|digital-twin-production\.jcquevedo84\.workers\.dev/;
 
 async function collectFiles(directory, prefix = "") {
   const entries = [];
@@ -72,12 +76,16 @@ async function verifyExport() {
     broken_navigation_anchors: 0,
     missing_digital_twin_endpoint: 0,
     missing_digital_twin_launcher: 0,
+    invalid_public_digital_twin_config: Number(publicDigitalTwin
+      && (configuredApi !== productionApi || !/^[A-Za-z0-9_-]{15,64}$/.test(siteKey))),
+    missing_public_digital_twin_bindings: 0,
     unexpected_digital_twin_content: 0,
     missing_public_contact: 0,
     missing_public_contact_links: 0,
   };
   let indexHtml = "";
   let digitalTwinBundled = false;
+  let publicDigitalTwinBundled = false;
 
   for (const { path, name, privatePath, regular } of entries) {
     if (privatePath) {
@@ -101,6 +109,8 @@ async function verifyExport() {
     if (name === "index.html") indexHtml = text;
     if (name.startsWith("_next/static/") && name.endsWith(".js") && text.includes("/v2/chat")) {
       digitalTwinBundled = true;
+      publicDigitalTwinBundled ||= Boolean(siteKey) && text.includes(productionApi) && text.includes(siteKey)
+        && text.includes("challenges.cloudflare.com/turnstile");
     }
     if (!digitalTwinEnabled && /\.(?:js|mjs|html|txt)$/i.test(name) && digitalTwinMarkers.test(text)) {
       results.unexpected_digital_twin_content += 1;
@@ -131,6 +141,7 @@ async function verifyExport() {
   results.broken_navigation_anchors = [...anchors].filter((id) => !sectionIds.has(id)).length;
   results.missing_digital_twin_endpoint = Number(digitalTwinEnabled && !digitalTwinBundled);
   results.missing_digital_twin_launcher = Number(digitalTwinEnabled && !indexHtml.includes('class="twin-launcher"'));
+  results.missing_public_digital_twin_bindings = Number(publicDigitalTwin && !publicDigitalTwinBundled);
   results.missing_public_contact = requiredPublicContact.length - publicContactFound.size;
   results.missing_public_contact_links = requiredContactLinks.filter((url) => !indexHtml.includes(`href="${url}`)).length;
 

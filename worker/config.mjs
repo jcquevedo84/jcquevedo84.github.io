@@ -27,12 +27,16 @@ export function loadWorkerConfig(environment) {
   const secret = environment.TURNSTILE_SECRET_KEY?.trim();
   const targetOrigin = `https://${hostname}`;
   const only = environment.OPENROUTER_ALLOWED_PROVIDERS?.split(",").map((value) => value.trim());
+  // A provider slug without a variant can match several endpoints.
+  const pinnedRoute = /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*:free$/.test(provider.model)
+    && only?.length === 1 && /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*$/.test(only[0]);
   const configured = Boolean(policy && secret && provider.apiKey && conversationSigningKey
     && secret !== provider.apiKey && secret !== conversationSigningKey
     && /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/i.test(hostname ?? "")
     && /^[\w-]{1,32}$/.test(action ?? "")
     && allowedOrigins.size === 1 && allowedOrigins.has(targetOrigin)
     && isZeroCostOpenRouterModel(provider.model)
+    && (environment.OPENROUTER_REQUIRE_PINNED_FREE_ROUTE !== "true" || pinnedRoute)
     && only?.length > 0 && only.length <= 8
     && only.every((value) => /^[a-z0-9][a-z0-9._/-]{0,127}$/i.test(value)));
 

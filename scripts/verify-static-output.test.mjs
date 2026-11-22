@@ -138,9 +138,26 @@ test("a disabled export rejects leftover launcher markup, hydration payloads, an
   await write("index.txt", '"className":"twin-panel"');
   await write("_next/static/orphan.js", 'fetch("/v2/chat");');
   await write("fallback.js", 'const url = "http://localhost:8787";');
+  await write("challenge.js", 'fetch("https://challenges.cloudflare.com/turnstile/v0/api.js");');
   const result = verify();
   assert.equal(result.status, 1);
-  assert.match(result.stdout, /^unexpected_digital_twin_content=4$/m);
+  assert.match(result.stdout, /^unexpected_digital_twin_content=5$/m);
+});
+
+test("an explicitly public export requires the production URL and public Turnstile key in the client", async (t) => {
+  const { verify, write } = await fixture(t);
+  const env = {
+    NEXT_PUBLIC_DIGITAL_TWIN_ENABLED: "true",
+    NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL: "https://digital-twin-production.jcquevedo84.workers.dev",
+    NEXT_PUBLIC_DIGITAL_TWIN_TURNSTILE_SITE_KEY: "synthetic_public_site_key",
+  };
+  assert.equal(verify(env).status, 1);
+  await write("_next/static/app.js", JSON.stringify([
+    "/v2/chat", env.NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL,
+    env.NEXT_PUBLIC_DIGITAL_TWIN_TURNSTILE_SITE_KEY, "https://challenges.cloudflare.com/turnstile/v0/api.js",
+  ]));
+  assert.equal(verify(env).status, 0);
+  assert.equal(verify({ ...env, NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL: "https://untrusted.example" }).status, 1);
 });
 
 test("static verification rejects subpath assets, broken anchors, and missing portrait and contact markup", async (t) => {

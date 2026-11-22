@@ -3,6 +3,7 @@ import test from "node:test";
 import { readFile } from "node:fs/promises";
 import { DigitalTwinApiError, requestDigitalTwinAnswer } from "../lib/digital-twin-api.ts";
 import { createDigitalTwinConversation } from "../lib/digital-twin-conversation.ts";
+import { getDigitalTwinChallenge } from "../lib/digital-twin-turnstile.ts";
 
 function useApiFixture(t, fetchImpl) {
   const previousBaseUrl = process.env.NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL;
@@ -58,6 +59,63 @@ test("frontend sends the latest Unicode question and bounded continuation withou
     return Response.json(answer("Continuación.", { ...conversation, token: context().token }));
   });
   assert.equal((await requestDigitalTwinAnswer({ question, conversation })).message.content, "Continuación.");
+});
+
+test("a rejected public request requires a fresh Turnstile token on manual Retry", async (t) => {
+  const calls = [];
+  let renderCount = 0;
+  const removed = [];
+  const container = {};
+  const hadWindow = Object.hasOwn(globalThis, "window");
+  const previousWindow = globalThis.window;
+  globalThis.window = {
+    setTimeout,
+    clearTimeout,
+    turnstile: {
+      render(element, options) {
+        assert.equal(element, container);
+        assert.equal(options.action, "digital_twin_chat");
+        assert.equal(options.retry, "never");
+        assert.equal(options["response-field"], false);
+        const id = String(++renderCount);
+        options.callback(`synthetic-${id}`);
+        return id;
+      },
+      remove: (id) => removed.push(id),
+    },
+  };
+  t.after(() => {
+    if (hadWindow) globalThis.window = previousWindow;
+    else delete globalThis.window;
+  });
+  useApiFixture(t, async (_url, options) => {
+    assert.equal(options.credentials, "omit");
+    assert.equal(options.redirect, "error");
+    assert.deepEqual(JSON.parse(options.body), { question: "Question" });
+    calls.push(options.headers["X-Digital-Twin-Challenge"]);
+    return calls.length === 1
+      ? Response.json({ error: { code: "provider_rate_limited", message: "PRIVATE UPSTREAM DETAIL" } }, { status: 429 })
+      : Response.json(answer("Reply"));
+  });
+  const widget = createDigitalTwinConversation((request, signal) => requestDigitalTwinAnswer(request, signal,
+    () => getDigitalTwinChallenge(container, "synthetic-site-key", signal)), "Welcome");
+  await widget.submit("Question");
+  assert.match(widget.getSnapshot().error, /free AI service has reached a temporary limit/);
+  assert.deepEqual(calls, ["synthetic-1"]);
+  await widget.retry();
+  assert.deepEqual(calls, ["synthetic-1", "synthetic-2"]);
+  assert.deepEqual(removed, ["1", "2"]);
+  assert.deepEqual(widget.getSnapshot().messages.map(({ content }) => content), ["Welcome", "Question", "Reply"]);
+});
+
+test("cancelling a public submission while Turnstile is pending blocks the POST", async (t) => {
+  useApiFixture(t, async () => assert.fail("unexpected provider request"));
+  const controller = new AbortController();
+  const request = requestDigitalTwinAnswer({ question: "Question" }, controller.signal, async () => {
+    controller.abort();
+    return "late-synthetic-challenge";
+  });
+  await assert.rejects(request, { name: "AbortError" });
 });
 
 test("frontend rejects malformed or mismatched response envelopes and displays a fixed expiry message", async (t) => {

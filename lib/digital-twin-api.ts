@@ -25,8 +25,8 @@ const SAFE_API_ERRORS: Record<string, string> = {
   service_not_configured: "The Digital Twin service configuration is incomplete.",
   provider_configuration_error: "The Digital Twin AI service configuration needs attention.",
   provider_billing_unavailable: "The Digital Twin AI service usage limit needs attention.",
-  provider_model_unavailable: "The configured AI model is currently unavailable.",
-  provider_rate_limited: "The Digital Twin is busy. Please try again shortly.",
+  provider_model_unavailable: "The free AI service is temporarily unavailable. Please try again later.",
+  provider_rate_limited: "The free AI service has reached a temporary limit. Please try again later.",
   provider_timeout: "The Digital Twin took too long to respond. Please retry.",
   provider_connection_error: "The connection to the AI service is temporarily unavailable.",
   provider_unavailable: "The Digital Twin AI provider is temporarily unavailable.",
@@ -38,6 +38,15 @@ const SAFE_API_ERRORS: Record<string, string> = {
   provider_unsupported_response: "The AI service returned an unsupported response format. Please retry.",
   provider_invalid_response: "The AI service returned an unusable response. Please retry.",
   rate_limited: "Too many requests. Please wait before trying again.",
+  claim_limit: "Verification is busy. Please wait before trying again.",
+  daily_limit: "The Digital Twin has reached its daily limit. Please try again tomorrow.",
+  minute_limit: "The Digital Twin is busy. Please wait a minute before trying again.",
+  capacity: "The Digital Twin is answering other questions. Please try again shortly.",
+  inference_disabled: "The Digital Twin is temporarily unavailable. You can still reach JC through the contact section.",
+  protection_unavailable: "The Digital Twin is temporarily unavailable. Please try again later.",
+  challenge_required: "Complete a fresh security check before sending your question.",
+  challenge_invalid: "The security check could not be verified. Please retry.",
+  challenge_expired_or_replayed: "The security check expired or was already used. Please retry for a fresh check.",
   origin_not_allowed: "The Digital Twin backend rejected this website origin.",
   conversation_unavailable: "The Digital Twin conversation service is not configured.",
   conversation_context_expired: "The conversation context expired. Retry to send your question without the earlier context.",
@@ -74,6 +83,7 @@ export function resolveDigitalTwinApiBaseUrl(): string | null {
 export async function requestDigitalTwinAnswer(
   request: DigitalTwinRequest,
   signal?: AbortSignal,
+  getChallenge?: () => Promise<string>,
 ): Promise<DigitalTwinAnswer> {
   signal?.throwIfAborted();
   const apiBaseUrl = resolveDigitalTwinApiBaseUrl();
@@ -94,18 +104,25 @@ export async function requestDigitalTwinAnswer(
     throw new DigitalTwinApiError(SAFE_API_ERRORS.payload_too_large, "payload_too_large");
   }
 
+  const challenge = await getChallenge?.();
+  signal?.throwIfAborted();
   let response: Response;
   try {
     response = await fetch(`${apiBaseUrl}/v2/chat`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(challenge && { "X-Digital-Twin-Challenge": challenge }),
+      },
       body,
       signal,
+      credentials: "omit",
+      redirect: "error",
     });
   } catch (error) {
     signal?.throwIfAborted();
     if (error instanceof DOMException && error.name === "AbortError") throw error;
-    throw new Error("The Digital Twin backend is unavailable. Confirm the local API is running and retry.");
+    throw new Error("The Digital Twin is temporarily unavailable. Please try again later.");
   }
 
   let payload: unknown;

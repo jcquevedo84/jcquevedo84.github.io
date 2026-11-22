@@ -1,8 +1,11 @@
 "use client";
 
 import { FormEvent, KeyboardEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { MAX_QUESTION_UNITS, requestDigitalTwinAnswer } from "@/lib/digital-twin-api";
+import { MAX_QUESTION_UNITS, requestDigitalTwinAnswer, resolveDigitalTwinApiBaseUrl } from "@/lib/digital-twin-api";
 import { createDigitalTwinConversation } from "@/lib/digital-twin-conversation";
+import { getDigitalTwinChallenge } from "@/lib/digital-twin-turnstile";
+
+const TURNSTILE_SITE_KEY = process.env.NEXT_PUBLIC_DIGITAL_TWIN_TURNSTILE_SITE_KEY?.trim();
 
 const WELCOME_MESSAGE =
   "Hello — I’m JC’s AI Digital Twin. I can answer questions about Juan Carlos’s documented professional background, engineering experience, education, and technical approach.";
@@ -22,7 +25,23 @@ export function DigitalTwin() {
   const [contactVisible, setContactVisible] = useState(false);
   const [heroActionsVisible, setHeroActionsVisible] = useState(false);
   const [portraitVisible, setPortraitVisible] = useState(false);
-  const [conversation] = useState(() => createDigitalTwinConversation(requestDigitalTwinAnswer, WELCOME_MESSAGE));
+  const [checking, setChecking] = useState(false);
+  const [conversation] = useState(() => createDigitalTwinConversation((request, signal) => {
+    const apiBaseUrl = resolveDigitalTwinApiBaseUrl();
+    const local = apiBaseUrl && ["localhost", "127.0.0.1"].includes(new URL(apiBaseUrl).hostname);
+    return requestDigitalTwinAnswer(request, signal, local ? undefined : async () => {
+      const container = document.getElementById("twin-turnstile");
+      if (!TURNSTILE_SITE_KEY || !container) {
+        throw new Error("The security check is temporarily unavailable. Please try again later.");
+      }
+      setChecking(true);
+      try {
+        return await getDigitalTwinChallenge(container, TURNSTILE_SITE_KEY, signal);
+      } finally {
+        if (!signal.aborted) setChecking(false);
+      }
+    });
+  }, WELCOME_MESSAGE));
   const { messages, loading, error, canRetry } = useSyncExternalStore(
     conversation.subscribe, conversation.getSnapshot, conversation.getSnapshot,
   );
@@ -32,6 +51,12 @@ export function DigitalTwin() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
 
+  function close() {
+    conversation.cancel();
+    setChecking(false);
+    setOpen(false);
+  }
+
   useEffect(() => {
     if (!open) return;
 
@@ -39,6 +64,8 @@ export function DigitalTwin() {
     const focusTimer = window.setTimeout(() => inputRef.current?.focus(), 80);
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") {
+        conversation.cancel();
+        setChecking(false);
         setOpen(false);
         return;
       }
@@ -46,7 +73,7 @@ export function DigitalTwin() {
       if (event.key !== "Tab" || !panelRef.current) return;
       const focusable = Array.from(
         panelRef.current.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+          'button:not([disabled]), textarea:not([disabled]), a[href], iframe, [tabindex]:not([tabindex="-1"])',
         ),
       );
       if (focusable.length === 0) return;
@@ -68,7 +95,7 @@ export function DigitalTwin() {
       document.removeEventListener("keydown", handleKeyDown);
       launcher?.focus();
     };
-  }, [open]);
+  }, [open, conversation]);
 
   useEffect(() => {
     if (!open) return;
@@ -133,6 +160,7 @@ export function DigitalTwin() {
 
   const startNewConversation = () => {
     conversation.reset();
+    setChecking(false);
     setDraft("");
     window.setTimeout(() => inputRef.current?.focus(), 0);
   };
@@ -141,7 +169,7 @@ export function DigitalTwin() {
 
   return (
     <div className={`digital-twin${open ? " is-open" : ""}${launcherObscured ? " contact-visible" : ""}${heroActionsVisible ? " hero-actions-visible" : ""}${portraitVisible ? " portrait-visible" : ""}`}>
-      {open && <button className="twin-backdrop" aria-label="Close Digital Twin" onClick={() => setOpen(false)} />}
+      {open && <button className="twin-backdrop" aria-label="Close Digital Twin" onClick={close} />}
 
       <button
         ref={launcherRef}
@@ -174,7 +202,7 @@ export function DigitalTwin() {
             </div>
             <div className="twin-header-actions">
               <button type="button" onClick={startNewConversation}>New conversation</button>
-              <button className="twin-close" type="button" aria-label="Close Digital Twin" onClick={() => setOpen(false)}>×</button>
+              <button className="twin-close" type="button" aria-label="Close Digital Twin" onClick={close}>×</button>
             </div>
           </header>
 
@@ -214,6 +242,11 @@ export function DigitalTwin() {
             <div ref={endRef} />
           </div>
 
+          <div className="twin-challenge">
+            {checking && <p role="status">Verifying your request…</p>}
+            <div id="twin-turnstile" />
+          </div>
+
           <form className="twin-composer" onSubmit={handleSubmit}>
             <label htmlFor="twin-question" className="sr-only">Ask a professional question</label>
             <textarea
@@ -231,7 +264,8 @@ export function DigitalTwin() {
           </form>
 
           <p className="twin-disclosure" id="twin-disclosure">
-            AI-generated answers based on a curated professional profile. This is an AI representation, not Juan Carlos speaking live. Do not share sensitive information.
+            This is an AI representation of JC. OpenRouter and its model provider process your question and relevant conversation context.
+            Usage metadata may be retained. Please avoid sensitive information. <a href="mailto:jcquevedo84@gmail.com">Privacy questions</a>
           </p>
         </aside>
       )}

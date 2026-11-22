@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,7 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { createConversationContext } from "../server/conversation-context.mjs";
 import { REQUEST_LIMITS } from "../server/validation.mjs";
+import { loadWorkerConfig } from "./config.mjs";
 import { chatHeaders, completion, jsonResponse, origin, providerKey, providerModel, providerName, runtimeConfig, startWorker, turnstileKey, verification } from "./test-fixture.mjs";
 
 async function assertError(response, status, code) {
@@ -18,6 +19,39 @@ async function assertError(response, status, code) {
   assert.equal(payload.error.code, code);
   return payload.error.message;
 }
+
+test("production starts disabled and requires one explicit free model and provider variant", async () => {
+  const config = JSON.parse(await readFile(new URL("../wrangler.production.jsonc", import.meta.url), "utf8"));
+  assert.equal(config.preview_urls, false);
+  assert.equal(config.vars.DIGITAL_TWIN_INFERENCE_ENABLED, "false");
+  assert.notEqual(config.ratelimits[0].namespace_id, runtimeConfig.ratelimits[0].namespace_id);
+  assert.deepEqual(config.exports.InferenceAdmission, { type: "durable-object", storage: "sqlite" });
+  const env = {
+    ...config.vars,
+    DIGITAL_TWIN_INFERENCE_ENABLED: "true",
+    DIGITAL_TWIN_CONVERSATION_SIGNING_KEY: "a1".repeat(32),
+    TURNSTILE_SECRET_KEY: "synthetic-turnstile-key",
+    OPENROUTER_API_KEY: "synthetic-provider-key",
+  };
+  const production = loadWorkerConfig(env);
+  assert.equal(production.configured, true);
+  assert.deepEqual(production.provider.routingPolicy, {
+    only: [env.OPENROUTER_ALLOWED_PROVIDERS],
+    zdr: true,
+    data_collection: "deny",
+    allow_fallbacks: false,
+    max_price: { prompt: 0, completion: 0, request: 0 },
+  });
+  for (const override of [
+    { OPENROUTER_MODEL: "openrouter/free" },
+    { OPENROUTER_MODEL: "inclusionai/ling-3.2-flash" },
+    { OPENROUTER_ALLOWED_PROVIDERS: "antdigital" },
+    { OPENROUTER_ALLOWED_PROVIDERS: "antdigital/fp8,other/fp8" },
+    { OPENROUTER_API_KEY: "" },
+  ]) {
+    assert.equal(loadWorkerConfig({ ...env, ...override }).configured, false);
+  }
+});
 
 function rawChat(t, url, write) {
   const request = httpRequest(new URL("/v2/chat", url), {
