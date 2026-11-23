@@ -7,7 +7,7 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { createConversationContext } from "../server/conversation-context.mjs";
 import { chatHeaders, completion, jsonResponse, origin, productionConfig, runtimeConfig, startWorker, verification } from "./test-fixture.mjs";
-import { completeWorkersAi, workersAiFailure } from "./workers-ai.mjs";
+import { completeWorkersAi, workersAiFailure, WORKERS_AI_TIMEOUT_MS } from "./workers-ai.mjs";
 
 const mockReply = "Synthetic professional answer.";
 const enabled = { DIGITAL_TWIN_INFERENCE_ENABLED: "true" };
@@ -87,7 +87,9 @@ test("production dispatches a single bounded native call per turn and signs bili
     assert.equal(model, "@cf/google/gemma-4-26b-a4b-it");
     assert.deepEqual(options, { rejectIfBusy: true });
     const { messages, ...generation } = inputs;
-    assert.deepEqual(generation, { max_completion_tokens: 1_500, n: 1, store: false, stream: false });
+    assert.deepEqual(generation, {
+      chat_template_kwargs: { enable_thinking: false }, max_completion_tokens: 640, n: 1, store: false, stream: false,
+    });
     assert.equal(messages[0].role, "system");
     assert.match(messages[0].content, /<professional_knowledge>\s*## /);
     assert.match(messages[0].content, /If the visitor writes in Spanish, answer naturally in Spanish\./);
@@ -132,16 +134,27 @@ test("production sanitizes unusable output and native Workers AI errors without 
   assert.equal(worker.rejectedOutboundRequests, 0);
 });
 
-test("the native adapter cancels its wait at the deadline even if the binding never settles", async () => {
+test("the native adapter cancels its wait at 40 seconds even if the binding never settles", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   let bindingSignal;
   const starts = [];
   const config = {
-    providerTimeoutMs: 5,
+    providerTimeoutMs: WORKERS_AI_TIMEOUT_MS,
     ai: { run(_model, _inputs, { signal }) { bindingSignal = signal; return new Promise(() => {}); } },
   };
-  await assert.rejects(completeWorkersAi(config, "Synthetic prompt", [], {
+  const pending = completeWorkersAi(config, "Synthetic prompt", [], {
     signal: new AbortController().signal, start: (options) => starts.push(options),
-  }), (error) => workersAiFailure(error)?.status === 504 && error.code === "provider_timeout");
+  });
+  t.mock.timers.tick(39_999);
+  assert.equal(bindingSignal.aborted, false);
+  t.mock.timers.tick(1);
+  await assert.rejects(pending, (error) => {
+    assert.deepEqual(workersAiFailure(error), {
+      status: 504,
+      payload: { error: { code: "provider_timeout", message: "The Digital Twin took too long to respond. Please retry." } },
+    });
+    return true;
+  });
   assert.deepEqual(starts, [{ upstream: true }]);
   assert.equal(bindingSignal.aborted, true);
 });
@@ -186,8 +199,9 @@ test("production enforces the trusted IP rate limit before the native binding", 
 
 test("production enforces concurrency and retains the lease after a failed dispatch", async (t) => {
   let reply;
-  const { chat, aiCalls } = await startProduction(t, {
+  const { chat, aiCalls, workerd } = await startProduction(t, {
     bindings: { DIGITAL_TWIN_MAX_CONCURRENT: "1" },
+    inspectAdmission: true,
     mockAi(response) {
       reply = () => jsonResponse(response, { message: "3036: sensitive upstream detail" }, 429);
     },
@@ -197,6 +211,16 @@ test("production enforces concurrency and retains the lease after a failed dispa
   try {
     const deadline = AbortSignal.timeout(3_000);
     while (!reply) await delay(10, undefined, { signal: deadline });
+    const storage = await workerd.unsafeGetDurableObjectStorage(
+      productionConfig.name, "InferenceAdmission", { name: "digital-twin-global" },
+    );
+    const leases = await storage.exec(`
+      SELECT start_by - admitted_at AS dispatch_window_ms, expires_at - start_by AS deadline_and_grace_ms
+      FROM inference_leases JOIN inference_attempts USING (id)
+    `);
+    assert.equal(leases.length, 1);
+    assert.equal(leases[0].dispatch_window_ms, 5_000);
+    assert.equal(leases[0].deadline_and_grace_ms, 45_000);
     await assertError(await chat(payload), 429, "capacity");
   } finally {
     reply?.();

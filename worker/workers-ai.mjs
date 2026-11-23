@@ -1,7 +1,7 @@
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
-const MAX_COMPLETION_TOKENS = 1_500;
+const MAX_COMPLETION_TOKENS = 640;
 const MAX_ANSWER_CHARACTERS = 24_000;
-export const WORKERS_AI_TIMEOUT_MS = 25_000;
+export const WORKERS_AI_TIMEOUT_MS = 40_000;
 
 const failures = {
   provider_rate_limited: [429, "The Digital Twin is busy. Please try again later."],
@@ -61,6 +61,7 @@ export async function completeWorkersAi({ ai, providerTimeoutMs }, systemPrompt,
   try {
     result = await Promise.race([aborted, ai.run(MODEL, {
       messages: [{ role: "system", content: systemPrompt }, ...messages],
+      chat_template_kwargs: { enable_thinking: false },
       max_completion_tokens: MAX_COMPLETION_TOKENS,
       n: 1,
       store: false,
