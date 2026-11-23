@@ -11,18 +11,22 @@ export function isZeroCostOpenRouterModel(model) {
   return normalizedModel === "openrouter/free" || normalizedModel.endsWith(":free");
 }
 
-export function loadConfig(environment = process.env) {
+export function loadAllowedOrigins(environment) {
   const configuredOrigins = environment.DIGITAL_TWIN_ALLOWED_ORIGINS
     ?.split(",")
     .map((origin) => origin.trim().replace(/\/$/, ""))
     .filter(Boolean);
+  return new Set(configuredOrigins?.length ? configuredOrigins : DEFAULT_ORIGINS);
+}
+
+export function loadConfig(environment = process.env) {
   const apiKey = environment.OPENROUTER_API_KEY?.trim() || "";
   const signingKey = environment.DIGITAL_TWIN_CONVERSATION_SIGNING_KEY?.trim() || "";
 
   return {
     port: boundedInteger(environment.DIGITAL_TWIN_PORT, 8787, 1024, 65535),
     host: environment.DIGITAL_TWIN_HOST?.trim() || "127.0.0.1",
-    allowedOrigins: new Set(configuredOrigins?.length ? configuredOrigins : DEFAULT_ORIGINS),
+    allowedOrigins: loadAllowedOrigins(environment),
     trustProxy: environment.DIGITAL_TWIN_TRUST_PROXY === "true",
     conversationSigningKey: signingKey === apiKey ? "" : signingKey,
     rateLimit: {

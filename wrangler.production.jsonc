@@ -1,12 +1,14 @@
 {
   "name": "digital-twin-production",
-  "main": "worker/index.mjs",
+  "main": "worker/production.mjs",
+  "keep_vars": true,
   "compatibility_date": "2026-11-17",
   "compatibility_flags": ["no_nodejs_compat", "no_nodejs_compat_v2"],
   "workers_dev": true,
   "preview_urls": false,
   "send_metrics": false,
   "observability": { "enabled": false },
+  "ai": { "binding": "AI" },
   "vars": {
     "DIGITAL_TWIN_INFERENCE_ENABLED": "false",
     "DIGITAL_TWIN_ALLOWED_ORIGINS": "https://jcquevedo84.github.io",

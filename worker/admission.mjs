@@ -20,17 +20,17 @@ function retryAfter(availableAt, now) {
   return Math.max(1, Math.ceil((availableAt - now) / 1_000));
 }
 
-export class InferenceAdmission extends DurableObject {
+export class Admission extends DurableObject {
   #storage;
   #sql;
   #policy;
   #now;
 
-  constructor(ctx, environment, now = Date.now) {
+  constructor(ctx, environment, policy, now = Date.now) {
     super(ctx, environment);
     this.#storage = ctx.storage;
     this.#sql = ctx.storage.sql;
-    this.#policy = loadAdmissionPolicy(environment);
+    this.#policy = policy;
     this.#now = now;
 
     this.#storage.transactionSync(() => {
@@ -164,5 +164,11 @@ export class InferenceAdmission extends DurableObject {
     if (scheduled === null || scheduled > when || (fromAlarm && scheduled <= now)) {
       await this.#storage.setAlarm(when);
     }
+  }
+}
+
+export class InferenceAdmission extends Admission {
+  constructor(ctx, environment, now = Date.now) {
+    super(ctx, environment, loadAdmissionPolicy(environment), now);
   }
 }

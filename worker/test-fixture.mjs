@@ -9,10 +9,13 @@ import { SITEVERIFY_URL } from "./turnstile.mjs";
 const { Miniflare } = miniflare;
 const root = fileURLToPath(new URL("../", import.meta.url));
 export const runtimeConfig = JSON.parse(await readFile(join(root, "wrangler.jsonc"), "utf8"));
+export const productionConfig = JSON.parse(await readFile(join(root, "wrangler.production.jsonc"), "utf8"));
 export const stagingConfig = JSON.parse(await readFile(join(root, "wrangler.staging.jsonc"), "utf8"));
 export const stagingFixtureConfig = JSON.parse(await readFile(join(root, "wrangler.staging-fixture.jsonc"), "utf8"));
+const mockAiUrl = "https://workers-ai.test/run";
 const modulePaths = [
   runtimeConfig.main,
+  productionConfig.main,
   stagingConfig.main,
   stagingFixtureConfig.main,
   "worker/staging-shared.mjs",
@@ -20,6 +23,7 @@ const modulePaths = [
   "worker/admission.mjs",
   "worker/config.mjs",
   "worker/turnstile.mjs",
+  "worker/workers-ai.mjs",
   "server/chat-service.mjs",
   "server/config.mjs",
   "server/conversation-context.mjs",
@@ -59,6 +63,25 @@ const clockFixture = `
       ).rowsRead;
     }
   }
+`;
+const aiFixture = `
+  import target from "./worker/production.mjs";
+  export { InferenceAdmission } from "./worker/production.mjs";
+  export default {
+    fetch(request, env, ctx) {
+      const AI = {
+        async run(model, inputs, { signal, ...options }) {
+          const response = await fetch(${JSON.stringify(mockAiUrl)}, {
+            method: "POST", body: JSON.stringify({ model, inputs, options }), signal,
+          });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.message);
+          return result;
+        },
+      };
+      return target.fetch(request, { ...env, AI }, ctx);
+    }
+  };
 `;
 
 export const origin = runtimeConfig.vars.DIGITAL_TWIN_ALLOWED_ORIGINS;
@@ -108,9 +131,11 @@ export async function startWorker(t, {
   persistencePath,
   rateLimit = config.ratelimits[0].simple.limit,
   mock = (response) => jsonResponse(response, completion("Synthetic reply.")),
+  mockAi,
   mockVerification = (response) => jsonResponse(response, verification()),
 } = {}) {
   const calls = [];
+  const aiCalls = [];
   const verifications = [];
   const logs = [];
   let rejectedOutboundRequests = 0;
@@ -119,7 +144,7 @@ export async function startWorker(t, {
     ...config.vars,
     ...(config === runtimeConfig && { DIGITAL_TWIN_INFERENCE_ENABLED: "true" }),
     DIGITAL_TWIN_CONVERSATION_SIGNING_KEY: signingKey,
-    ...(config !== stagingFixtureConfig && {
+    ...(config !== stagingFixtureConfig && config !== productionConfig && {
       OPENROUTER_API_KEY: providerKey,
       OPENROUTER_MODEL: providerModel,
       OPENROUTER_ALLOWED_PROVIDERS: providerName,
@@ -147,7 +172,8 @@ export async function startWorker(t, {
 
   async function handleOutbound(request, response) {
     const url = new URL(request.url, `https://${request.headers.host}`).href;
-    if (![OPENROUTER_URL, SITEVERIFY_URL].includes(url) || request.method !== "POST") {
+    const allowedProviderUrl = config === productionConfig ? mockAiUrl : OPENROUTER_URL;
+    if (![allowedProviderUrl, SITEVERIFY_URL].includes(url) || request.method !== "POST") {
       rejectedOutboundRequests += 1;
       response.writeHead(502).end();
       return;
@@ -159,6 +185,9 @@ export async function startWorker(t, {
       if (url === OPENROUTER_URL) {
         calls.push(call);
         mock(response, calls.length, call);
+      } else if (url === mockAiUrl) {
+        aiCalls.push(call);
+        mockAi(response, aiCalls.length, call);
       } else {
         verifications.push(call);
         mockVerification(response, verifications.length, call);
@@ -168,7 +197,7 @@ export async function startWorker(t, {
     }
   }
 
-  const entryFixture = controlledClock ? clockFixture : abortRequestAfterMs === undefined ? null : `
+  const entryFixture = controlledClock ? clockFixture : mockAi ? aiFixture : abortRequestAfterMs === undefined ? null : `
     import target from ${JSON.stringify(`./${config.main}`)};
     export { InferenceAdmission } from "./worker/admission.mjs";
     export default {
@@ -223,7 +252,7 @@ export async function startWorker(t, {
   });
 
   return {
-    workerd, stop, url, calls, verifications, logs, fetchRoute, chat, signingKey,
+    workerd, stop, url, calls, aiCalls, verifications, logs, fetchRoute, chat, signingKey,
     get rejectedOutboundRequests() { return rejectedOutboundRequests; },
   };
 }

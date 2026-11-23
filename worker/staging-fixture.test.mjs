@@ -110,13 +110,17 @@ test("workerd fixture holds two six-second leases, rejects replay, and returns s
     OPENROUTER_MODEL: "unapproved/provider:free",
   } });
   const before = Date.now();
-  const results = await Promise.all(tokens.map((token) => fixture.chat({ token })));
-  assert.deepEqual(results.map((r) => r.status).sort(), [200, 200, 429]);
+  // Consume the fast 429 response while the two admitted requests are still running.
+  const results = await Promise.all(tokens.map(async (token) => {
+    const response = await fixture.chat({ token });
+    return { response, body: await response.json() };
+  }));
+  assert.deepEqual(results.map(({ response }) => response.status).sort(), [200, 200, 429]);
   assert.ok(Date.now() - before >= 6_000);
-  const saturated = results.find((r) => r.status === 429);
-  assert.ok(Number(saturated.headers.get("retry-after")) > 0);
-  await expectError(saturated, 429, "capacity");
-  const successes = await Promise.all(results.flatMap((r, index) => r.ok ? [r.json().then((body) => ({ body, index }))] : []));
+  const saturated = results.find(({ response }) => response.status === 429);
+  assert.ok(Number(saturated.response.headers.get("retry-after")) > 0);
+  assert.equal(saturated.body.error?.code, "capacity");
+  const successes = results.flatMap(({ response, body }, index) => response.ok ? [{ body, index }] : []);
   const { body, index } = successes[0];
   assert.match(body.message.content, /JavaScript/);
   await expectError(await fixture.chat({ token: tokens[index] }), 403, "challenge_expired_or_replayed");

@@ -1,6 +1,6 @@
 # Juan Carlos Rodríguez Quevedo Professional Portfolio
 
-Static Next.js portfolio with an independent AI-powered professional Digital Twin. The frontend is compatible with GitHub Pages; the AI API is a separate Node.js service and must be deployed to an environment that can protect `OPENROUTER_API_KEY`.
+Static Next.js portfolio with an independent AI-powered professional Digital Twin. GitHub Pages serves the frontend. The public chat API uses a Cloudflare Worker with a native Workers AI binding. Local development uses the standalone Node.js API and OpenRouter.
 
 ## Local development
 
@@ -55,7 +55,7 @@ npm ci
 npm run test:worker
 ```
 
-The tests run the Worker and its SQLite-backed Durable Object in `workerd` through Miniflare. They use synthetic bindings and intercept all outbound requests to the Turnstile and OpenRouter endpoints. Neither the frontend nor the Node.js API needs to be running.
+The tests run the Workers and their SQLite-backed Durable Objects in `workerd` through Miniflare. They mock Turnstile and each inference adapter, including the production `AI.run()` binding. Neither the frontend nor the Node.js API needs to be running.
 
 To start the standalone Worker for a local health check:
 
@@ -124,7 +124,7 @@ Static verification checks public content and root-relative assets, private path
 
 To enable structured backend diagnostics temporarily, start the API with `OPENROUTER_DEBUG=true`. Diagnostics are disabled by default. Request message content is replaced with `[REDACTED]`; response content is never logged. Logs include correlation IDs, request shape and size, upstream HTTP status, safe headers, sanitized provider errors, and transport failure categories. Do not enable debug logging as a substitute for production observability or persist the console output without an appropriate retention policy.
 
-Production chat requests default to `OPENROUTER_MAX_COMPLETION_TOKENS=1500`; configuration is bounded to a maximum of 2000. This budget includes reasoning tokens for models that use them, so a larger limit does not guarantee visible output. Safe debug metadata includes the requested and actual models, finish reason, prompt/completion/reasoning token counts when supplied by OpenRouter, visible text length, and whether the result appears truncated. Responses ending because of a token limit, reasoning-only responses, and unsupported content structures are rejected with a sanitized retryable error. Retry remains a manual visitor action; the backend does not make automatic repeat or fallback requests.
+OpenRouter chat requests default to `OPENROUTER_MAX_COMPLETION_TOKENS=1500`, bounded to a maximum of 2000. This budget includes reasoning tokens for models that use them, so a larger limit does not guarantee visible output. Safe debug metadata includes the requested and actual models, finish reason, prompt/completion/reasoning token counts when supplied by OpenRouter, visible text length, and whether the result appears truncated. Responses ending because of a token limit, reasoning-only responses, and unsupported content structures are rejected with a sanitized retryable error. Retry remains a manual action.
 
 `npm run build` writes the GitHub Pages-compatible static site to `out/`. The static site does not require a Next.js server. `npm run preview` serves the existing `out/` directory on port 3000.
 
@@ -133,9 +133,9 @@ Production chat requests default to `OPENROUTER_MAX_COMPLETION_TOKENS=1500`; con
 1. `app/` and `components/` contain the statically exported portfolio and browser-only chat interface.
 2. `server/` contains the standalone API, curated public-safe professional knowledge, prompt policy, request validation, rate limiting, CORS handling, and the OpenRouter client.
 3. When the widget is enabled, the browser calls `NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL`. This value is public and contains no credential. When unset on localhost, the browser uses the same hostname on port 8787. A future public build with the widget enabled must set the deployed HTTPS API URL explicitly.
-4. The backend reads `OPENROUTER_API_KEY` and `OPENROUTER_MODEL`, then calls `https://openrouter.ai/api/v1/chat/completions` with that exact configured model. Neither variable is returned to the browser.
+4. `worker/production.mjs` serves protected V2 and calls `env.AI.run()` with `@cf/google/gemma-4-26b-a4b-it`. The local API and OpenRouter-backed staging modes continue to use their existing OpenRouter configuration.
 
-The original professional documents remain under ignored `resource/` storage and are not read at runtime, copied into the static site, or sent to OpenRouter. The backend sends only topic-selected sections from a curated public-safe knowledge representation.
+The backend sends only topic-selected sections from the curated public-safe knowledge representation. The original professional documents remain under ignored `resource/` storage, outside the runtime and static export.
 
 ### Chat API and conversation history
 
@@ -190,26 +190,19 @@ Leave the flag unset for local development and CI validation with the widget. Wh
 
 For the first release, cancel any pending Pages workflow runs and restore **Settings → Pages → Source → Deploy from a branch**, with branch `master` and folder `/ (root)`. Save and confirm that GitHub reports a successful Pages deployment and that the root URL again serves **SpaceX Platzi**. If the previous source recorded before release differs, restore those recorded settings instead. For later portfolio-only recovery, restore the last approved portfolio code on the release branch through a reviewed change and redeploy through the same gate with the widget disabled.
 
-## Future Digital Twin deployment
+## Production Digital Twin deployment review
 
-Once the public API protections are ready, review the Pages workflow and the standalone API deployment together. For a local preview of a future enabled production configuration, use a deployed HTTPS API URL:
+`wrangler.production.jsonc` targets the existing `digital-twin-production` Worker and keeps `DIGITAL_TWIN_INFERENCE_ENABLED` set to `false`. It adds the `AI` binding and retains the existing OpenRouter configuration for recovery. The production code uses the existing `TURNSTILE_SECRET_KEY` and `DIGITAL_TWIN_CONVERSATION_SIGNING_KEY` and uses the exact GitHub Pages origin `https://jcquevedo84.github.io`. Keep the signing key intact so existing valid continuations remain verifiable.
+
+Workers AI receives one synchronous request per admitted turn, with a 1,500-token completion cap, a 25-second deadline, and immediate rejection when capacity is unavailable. The application returns sanitized errors for quota, capacity, deadline, and model failures. An uncertain call retains its admission lease until expiry. The binding uses the native Cloudflare-hosted model without AI Gateway. Before any separate activation, verify that the account uses the Workers Free plan so daily quota exhaustion rejects further calls without overage charges. [Workers AI pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)
+
+Run local preflight from a copy containing only the project sources and installed dependencies. Exclude local secret files and build with the pinned toolchain.
 
 ```bash
-NEXT_PUBLIC_DIGITAL_TWIN_API_BASE_URL=https://api.example.com npm run build
+npm run verify
+./node_modules/.bin/wrangler deploy --config wrangler.production.jsonc --dry-run
 ```
 
-Configure the backend allowlist with the public portfolio origins:
+Review the deployment separately. Record the currently deployed disabled version and compare the production dashboard variable values and binding identities with the file. `keep_vars: true` asks Wrangler to preserve dashboard-managed variables. Pinned Wrangler deploys also retain existing secrets unless explicitly changed. Check any names declared both in the file and in the dashboard, especially the disabled inference flag, allowed origin, and admission limits. [Wrangler configuration](https://developers.cloudflare.com/workers/wrangler/configuration/)
 
-```text
-DIGITAL_TWIN_ALLOWED_ORIGINS=https://jcquevedo84.github.io,https://jcquevedo84.com
-```
-
-Configure `OPENROUTER_API_KEY` as a secret in the independently deployed backend and `OPENROUTER_MODEL` as a backend environment variable. Do not upload the local `.env` file to GitHub Pages or any source repository; GitHub Pages receives only the static frontend and cannot safely hold either value.
-
-Provision `DIGITAL_TWIN_CONVERSATION_SIGNING_KEY` in the backend's managed secret store. Use a dedicated random key per environment and share that environment's key across its backend replicas. Keep the key out of frontend build variables, source control, and logs. Provision the V2-capable backend before publishing the updated static frontend. Rotation makes outstanding tokens fail verification, and visitors can Retry without earlier context. If the frontend needs to roll back, keep the hardened V1 backend behavior so older clients continue using latest-question-only inference.
-
-For a separately approved staging deployment, use a distinct rate-limit namespace and Durable Object namespace. Register the exact expected Turnstile hostname and action. Provision `TURNSTILE_SECRET_KEY`, a replacement `OPENROUTER_API_KEY`, and an independent random `DIGITAL_TWIN_CONVERSATION_SIGNING_KEY` as encrypted secrets. Confirm that real edge ingress supplies the expected metadata and that worst-case inputs fit the chosen Workers CPU and quota limits.
-
-The Worker requires a configured free model and a reviewed `OPENROUTER_ALLOWED_PROVIDERS` allowlist. Its requests require ZDR, deny data collection, cap prompt, completion, and per-request prices at zero, and disable provider fallback. Verify the exact provider/model route and account logging controls separately before activating it. Keep inference off if no eligible endpoint is available. The Worker emits bounded outcome and timing fields. Cloud observability is disabled in the checked-in configuration.
-
-For rollback after an approved staging or production deployment, disable inference first and verify that chat returns a sanitized 503 while health remains available. Preserve the admission namespace and state. In-flight provider exchanges can continue through the existing deadlines as the new version propagates. Roll back only to a compatible protected version, or roll forward with inference kept off if the class or schema changed.
+Confirm that the existing `ADMISSION` binding points to `InferenceAdmission` with its current SQLite namespace and that `CHAT_RATE_LIMITER` uses namespace `1003` with an eight-request limit per 60 seconds. Check the names of the existing secrets without exporting values. After a separately approved deployment, recheck these bindings and the dashboard variables. Confirm `GET /health` returns `200` and an allowed-origin `POST /v2/chat` returns `503 inference_disabled`. If those checks fail, recover using the recorded compatible disabled version, or roll forward with inference disabled, then repeat the binding and endpoint checks.

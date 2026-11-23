@@ -20,12 +20,8 @@ async function assertError(response, status, code) {
   return payload.error.message;
 }
 
-test("production starts disabled and requires one explicit free model and provider variant", async () => {
+test("the legacy OpenRouter configuration can require one explicit free model and provider variant", async () => {
   const config = JSON.parse(await readFile(new URL("../wrangler.production.jsonc", import.meta.url), "utf8"));
-  assert.equal(config.preview_urls, false);
-  assert.equal(config.vars.DIGITAL_TWIN_INFERENCE_ENABLED, "false");
-  assert.notEqual(config.ratelimits[0].namespace_id, runtimeConfig.ratelimits[0].namespace_id);
-  assert.deepEqual(config.exports.InferenceAdmission, { type: "durable-object", storage: "sqlite" });
   const env = {
     ...config.vars,
     DIGITAL_TWIN_INFERENCE_ENABLED: "true",
@@ -33,9 +29,9 @@ test("production starts disabled and requires one explicit free model and provid
     TURNSTILE_SECRET_KEY: "synthetic-turnstile-key",
     OPENROUTER_API_KEY: "synthetic-provider-key",
   };
-  const production = loadWorkerConfig(env);
-  assert.equal(production.configured, true);
-  assert.deepEqual(production.provider.routingPolicy, {
+  const legacy = loadWorkerConfig(env);
+  assert.equal(legacy.configured, true);
+  assert.deepEqual(legacy.provider.routingPolicy, {
     only: [env.OPENROUTER_ALLOWED_PROVIDERS],
     zdr: true,
     data_collection: "deny",

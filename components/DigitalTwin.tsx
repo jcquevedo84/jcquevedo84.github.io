@@ -264,8 +264,8 @@ export function DigitalTwin() {
           </form>
 
           <p className="twin-disclosure" id="twin-disclosure">
-            This is an AI representation of JC. OpenRouter and its model provider process your question and relevant conversation context.
-            Usage metadata may be retained. Please avoid sensitive information. <a href="mailto:jcquevedo84@gmail.com">Privacy questions</a>
+            This is an AI representation of JC. Cloudflare Workers AI processes your question and relevant conversation context.
+            Cloudflare may retain operational metadata. Please avoid sensitive information. <a href="mailto:jcquevedo84@gmail.com">Privacy questions</a>
           </p>
         </aside>
       )}
